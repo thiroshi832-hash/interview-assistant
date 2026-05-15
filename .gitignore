@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local app/user data
+.env
+.env.*
+*.local
+audio/*.wav
+audio/*.mp3
+audio/*.m4a
+audio/*.flac
+
+# PyInstaller output
+build/
+dist/
+*.spec.bak
+
+# Logs
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/

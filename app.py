@@ -29,6 +29,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from audio.auto_labeler import AutoLabeler
 from audio.diarizer import Diarizer
 from audio.dual_stream import DualStreamSource
+from audio.network_source import NetworkAudioSource
 from audio.single_mic import SingleMicSource
 from audio.source import AudioSource
 from config import Config
@@ -47,8 +48,9 @@ from ui.evaluation_dialog import EvaluationDialog
 from ui.api_key_dialog import ApiKeyDialog
 from ui.license_dialog import LicenseDialog
 from ui.main_window import MainWindow
-from ui.mode_picker import MODE_HELPER, MODE_SAME, ModePicker
+from ui.mode_picker import MODE_HELPER, MODE_HELPER_NETWORK, MODE_SAME, ModePicker
 from ui.model_loading_dialog import ModelLoadingDialog
+from ui.network_connect_dialog import NetworkConnectDialog
 from ui.voice_enroll_dialog import VoiceEnrollDialog
 
 
@@ -73,6 +75,7 @@ class App(QObject):
     answer_chunk = Signal(str)
     status = Signal(str)
     health_update = Signal(int, str, str)   # score, label, note
+    mic_level = Signal(int)                  # 0..100 mic input level
 
     def __init__(self, mode: str, cfg: Config):
         super().__init__()
@@ -80,22 +83,35 @@ class App(QObject):
         self.mode = mode
 
         # ── audio path ────────────────────────────────────────────────────
-        self.source: AudioSource = (
-            DualStreamSource(cfg) if mode == MODE_SAME else SingleMicSource(cfg)
-        )
+        # Three sources:
+        #   same             → DualStreamSource (local mic + WASAPI loopback)
+        #   helper           → SingleMicSource  (single mic acoustically)
+        #   helper_network   → NetworkAudioSource (WebSocket to remote sender;
+        #                      two cleanly-tagged streams, no diarization)
+        if mode == MODE_SAME:
+            self.source: AudioSource = DualStreamSource(cfg)
+        elif mode == MODE_HELPER_NETWORK:
+            self.source = NetworkAudioSource(cfg, cfg.network_host, cfg.network_port)
+        else:
+            self.source = SingleMicSource(cfg)
         # The STT backend handles its own thread + transcription. The
         # Segmenter does VAD only, feeds chunks during speech, and signals
         # close on silence.
         self.stt = make_stt_backend(cfg)
-        # Deepgram does its own VAD + endpointing. In same-laptop mode we
-        # bypass our VAD entirely (it would otherwise cut the first ~200ms
-        # off each utterance). Helper-laptop mode still needs local VAD so
-        # the diarizer can embed complete clips.
-        pass_through = (cfg.stt_engine == "deepgram" and mode == MODE_SAME)
+        # Deepgram does its own VAD + endpointing — bypass our local VAD
+        # for ANY mode when it's the chosen engine. In helper mode the
+        # DeepgramBackend itself accumulates PCM into _pending_pcm and
+        # attaches it to the final STTEvent, so the diarizer still gets a
+        # complete clip to embed.
+        # (Previously only `same-laptop + deepgram` got pass-through, which
+        # meant helper-laptop + deepgram silently dropped quiet acoustic
+        # audio that didn't clear the 0.5 VAD probability threshold.)
+        pass_through = (cfg.stt_engine == "deepgram")
         self.segmenter = Segmenter(
             self.source, cfg,
             on_chunk=self._on_speech_chunk,
             on_close=self._on_speech_close,
+            on_level=lambda lvl: self.mic_level.emit(lvl),
             pass_through=pass_through,
         )
 
@@ -111,7 +127,13 @@ class App(QObject):
                 np.asarray(cfg.candidate_voice_embedding, dtype=np.float32)
                 if cfg.candidate_voice_embedding else None
             )
-            self.diarizer = Diarizer(candidate_anchor=anchor)
+            try:
+                self.diarizer = Diarizer(candidate_anchor=anchor)
+            except Exception:
+                # resemblyzer not bundled (slim build). Fall back to the
+                # heuristic auto-labeler — works without voice fingerprint.
+                self.diarizer = None
+                anchor = None
             if anchor is None:
                 self.auto_labeler = AutoLabeler(cfg.auto_label_min_utterances)
 
@@ -123,6 +145,10 @@ class App(QObject):
         # Subscribe to transcript updates so we emit `turn_update` whenever
         # the transcript changes (partial or final, replaced or new).
         self.transcript.subscribe(self._on_transcript_change)
+        # Diarize-tag watchdog state — used to warn the user if Deepgram
+        # diarization is on but never producing per-word speaker IDs.
+        self._finals_seen_without_diarize: int = 0
+        self._diarize_warning_emitted: bool = False
 
         # ── threading ─────────────────────────────────────────────────────
         self._answer_thread: threading.Thread | None = None
@@ -175,6 +201,21 @@ class App(QObject):
             raise
         self.segmenter.start()
         self.status.emit(f"Listening — mode: {self.mode}")
+
+        # Watchdog — if no audio chunks have arrived 5 seconds in, warn loudly.
+        # Catches Windows mic privacy blocks, wrong default device, etc.
+        def _audio_watchdog():
+            time.sleep(5.0)
+            if self._stop.is_set():
+                return
+            if self.segmenter.first_chunk_at is None:
+                self.status.emit(
+                    "⚠ No audio detected — check (1) Windows Sound settings → "
+                    "Input device, (2) Settings → Privacy → Microphone → "
+                    "'Allow desktop apps to access your microphone', "
+                    "(3) the mic isn't muted in the volume mixer."
+                )
+        threading.Thread(target=_audio_watchdog, daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -248,14 +289,27 @@ class App(QObject):
         User-triggered: invert candidate/interviewer labels and lock them.
         Same-laptop mode (known speakers per stream): just flips the static
         mapping for new utterances. Helper mode: tells the auto-labeler to
-        invert + lock so it never re-flips by itself.
+        invert + lock so it never re-flips by itself, AND flips the
+        Deepgram-diarize-tag map.
+
+        After a manual swap, the mapping is also LOCKED — future anchor
+        re-evaluations on short clips won't overwrite the user's choice.
         """
         if self.auto_labeler is not None:
             self.auto_labeler.swap_and_lock()
-        else:
-            # same-laptop mode: flip the source-tagged labels going forward
+        # If Deepgram diarization is producing tags, invert their mapping too.
+        dg_map = getattr(self, "_dg_speaker_map", None)
+        if dg_map:
+            self._dg_speaker_map = {
+                tag: ("candidate" if label == "interviewer" else "interviewer")
+                for tag, label in dg_map.items()
+            }
+            # User has spoken — their decision is now authoritative.
+            self._dg_map_user_locked = True
+        # Same-laptop swap toggle stays for the case with no diarizer / no map.
+        if self.auto_labeler is None and not dg_map:
             self._same_laptop_swap = not getattr(self, "_same_laptop_swap", False)
-        self.status.emit("Labels swapped — future turns use the new mapping.")
+        self.status.emit("Labels swapped — future turns use the new mapping (locked).")
 
     # ── audio → text path ────────────────────────────────────────────────
     def _on_speech_chunk(self, speaker: Optional[str], pcm: bytes, ts: float) -> None:
@@ -282,24 +336,118 @@ class App(QObject):
             speaker = event.speaker
             if getattr(self, "_same_laptop_swap", False):
                 speaker = "interviewer" if speaker == "candidate" else "candidate"
-        elif event.is_final and event.pcm:
-            # Helper mode + final: full PCM available, run diarizer.
-            assert self.diarizer is not None
-            if self.diarizer.has_anchor:
-                label = self.diarizer.assign_labeled(event.pcm, self.cfg.sample_rate)
-                if label is None:
-                    return
-                speaker = label
-            else:
-                assert self.auto_labeler is not None
-                cluster = self.diarizer.assign(event.pcm, self.cfg.sample_rate)
-                if cluster is None:
-                    return
-                speaker = self.auto_labeler.observe(cluster, text, event.ts_end)
         else:
-            # Partial in helper-laptop mode — can't classify without the
-            # full PCM. Skip partials in this mode; user sees the final.
-            return
+            # Helper-laptop mode — single mic stream. Two paths to a label:
+            #
+            #   Preferred: Deepgram's server-side diarization tags each word
+            #   with a stable speaker ID. We map those tags to candidate /
+            #   interviewer ONCE per session (via the anchor embedding on the
+            #   first sufficient final), then reuse the mapping for every
+            #   subsequent partial + final.
+            #
+            #   Fallback: no diarize tag → fall back to embedding-on-final
+            #   (works for whisper.cpp, or Deepgram if diarization is off).
+            speaker = None
+            tag = event.diarize_speaker
+
+            if tag is not None:
+                # Lazy-init the diarize-tag → label map.
+                if not hasattr(self, "_dg_speaker_map"):
+                    self._dg_speaker_map: dict[str, str] = {}
+
+                user_locked = getattr(self, "_dg_map_user_locked", False)
+
+                if tag in self._dg_speaker_map:
+                    speaker = self._dg_speaker_map[tag]
+                elif user_locked:
+                    # The user manually swapped — they want the existing mapping
+                    # preserved. A new tag here is the OTHER role.
+                    other = {"candidate", "interviewer"} - set(self._dg_speaker_map.values())
+                    speaker = other.pop() if other else "interviewer"
+                    self._dg_speaker_map[tag] = speaker
+                elif event.is_final and event.pcm and self.diarizer is not None and self.diarizer.has_anchor:
+                    # First time we see this tag with a usable final. ONLY lock
+                    # the mapping if the audio is long enough to embed reliably
+                    # — resemblyzer is unreliable on <1.5s clips. Until then we
+                    # use a tentative label but keep re-trying on each final.
+                    pcm_bytes = len(event.pcm)
+                    audio_seconds = pcm_bytes / (2 * self.cfg.sample_rate)  # int16 mono
+                    MIN_LOCK_SECONDS = 1.5
+                    try:
+                        label = self.diarizer.assign_labeled(event.pcm, self.cfg.sample_rate)
+                    except Exception:
+                        label = None
+                    if label and audio_seconds >= MIN_LOCK_SECONDS:
+                        self._dg_speaker_map[tag] = label
+                        speaker = label
+                        self.status.emit(
+                            f"Deepgram speaker '{tag}' identified as {label} "
+                            f"(via voice anchor, {audio_seconds:.1f}s of audio)."
+                        )
+                    elif label:
+                        # Tentative — show the label but don't lock.
+                        speaker = label
+                        self.status.emit(
+                            f"Speaker '{tag}' tentative '{label}' "
+                            f"({audio_seconds:.1f}s — need ≥{MIN_LOCK_SECONDS}s to lock). "
+                            f"Click Swap if wrong; speak more to confirm."
+                        )
+                # If we have ≥2 known tags and this is a new one, infer it's
+                # the OTHER role (someone different from the ones we know).
+                if speaker is None and self._dg_speaker_map:
+                    known_labels = set(self._dg_speaker_map.values())
+                    if "candidate" in known_labels and tag not in self._dg_speaker_map:
+                        self._dg_speaker_map[tag] = "interviewer"
+                        speaker = "interviewer"
+                        self.status.emit(f"Deepgram speaker '{tag}' assumed interviewer.")
+                    elif "interviewer" in known_labels and tag not in self._dg_speaker_map:
+                        self._dg_speaker_map[tag] = "candidate"
+                        speaker = "candidate"
+                        self.status.emit(f"Deepgram speaker '{tag}' assumed candidate.")
+                # If no anchor exists AND this is our first tag ever, default
+                # the first speaker we hear to "interviewer" (typical opening).
+                if speaker is None and not self._dg_speaker_map and event.is_final:
+                    self._dg_speaker_map[tag] = "interviewer"
+                    speaker = "interviewer"
+                    self.status.emit(
+                        f"Deepgram speaker '{tag}' defaulted to interviewer "
+                        f"(no voice enrollment — click Swap if wrong)."
+                    )
+
+            # Watchdog: if Deepgram finals keep coming with no speaker tag at
+            # all, diarization isn't actually running. Warn the user once.
+            if event.is_final and tag is None and self.cfg.stt_engine == "deepgram":
+                self._finals_seen_without_diarize += 1
+                if (self._finals_seen_without_diarize >= 3
+                        and not self._diarize_warning_emitted):
+                    self._diarize_warning_emitted = True
+                    self.status.emit(
+                        "⚠ Deepgram isn't tagging words with speaker IDs — "
+                        "diarization may not be supported by the selected model "
+                        f"({self.cfg.deepgram_model}) or your account tier. "
+                        "Labels will use a best-effort default; use Swap if wrong."
+                    )
+
+            # Path 2 (fallback): no diarize tag, or still nothing decided.
+            if speaker is None:
+                speaker = getattr(self, "_helper_last_speaker", "interviewer")
+                if event.is_final and event.pcm and self.diarizer is not None:
+                    try:
+                        if self.diarizer.has_anchor:
+                            label = self.diarizer.assign_labeled(event.pcm, self.cfg.sample_rate)
+                        else:
+                            assert self.auto_labeler is not None
+                            cluster = self.diarizer.assign(event.pcm, self.cfg.sample_rate)
+                            label = (self.auto_labeler.observe(cluster, text, event.ts_end)
+                                     if cluster else None)
+                    except Exception:
+                        label = None
+                    if label:
+                        speaker = label
+
+            self._helper_last_speaker = speaker
+            if getattr(self, "_same_laptop_swap", False):
+                speaker = "interviewer" if speaker == "candidate" else "candidate"
 
         # ── Echo filter (finals only) ────────────────────────────────────
         if event.is_final and speaker == "candidate":
@@ -441,9 +589,17 @@ def main() -> int:
         return 0
     mode = picker.mode
 
-    # 2) voice enrollment — onboarding step, helper-laptop mode only.
-    # In same-laptop mode, speakers are known by audio stream; no enrollment
-    # needed. We only show the dialog if the user hasn't enrolled before.
+    # 1a) helper-network mode: ask for the sender's host:port
+    if mode == MODE_HELPER_NETWORK:
+        nc = NetworkConnectDialog(cfg)
+        if nc.exec() != nc.DialogCode.Accepted:
+            return 0
+        # Values are persisted by the dialog itself; cfg.network_host/port now set.
+
+    # 2) voice enrollment — onboarding step, helper-laptop (acoustic) only.
+    # In same-laptop AND helper-network modes, speakers are known by stream/tag;
+    # no enrollment needed. We only show the dialog if the user hasn't
+    # enrolled before.
     if mode == MODE_HELPER and not cfg.candidate_voice_embedding:
         ve = VoiceEnrollDialog()
         ve.exec()  # user may Skip; either way we proceed
@@ -471,6 +627,7 @@ def main() -> int:
         controller.answer_chunk.connect(win.interview_view.append_answer_chunk, Qt.ConnectionType.QueuedConnection)
         controller.status.connect(win.interview_view.set_status, Qt.ConnectionType.QueuedConnection)
         controller.health_update.connect(win.interview_view.set_health, Qt.ConnectionType.QueuedConnection)
+        controller.mic_level.connect(win.interview_view.set_mic_level, Qt.ConnectionType.QueuedConnection)
 
         # Wire UI buttons → controller
         win.interview_view.answer_now.connect(lambda: controller and controller.force_answer())
@@ -509,6 +666,8 @@ def main() -> int:
         # interviewer utterance doesn't sit in a queue while gigabytes
         # download silently. Also pre-warms the LLM HTTPS connection + cache
         # so the first answer streams as fast as the rest.
+        # Resemblyzer (voice fingerprint) is only used by acoustic helper mode.
+        # Network mode has tagged streams, so no fingerprinting needed.
         need_resemblyzer = (mode == MODE_HELPER)
         loading = ModelLoadingDialog(
             cfg,

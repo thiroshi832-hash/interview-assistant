@@ -62,6 +62,14 @@ class _SpeakerStream:
         # transcript line keeps growing across the utterance, and only emit
         # OUR final when `speech_final=True` arrives.
         self._committed_segments: str = ""
+        # Most-recent diarize speaker ID — Deepgram tags each word; we track
+        # the dominant speaker for forwarding to the controller.
+        self._last_diarize_speaker: Optional[str] = None
+        # Per-phrase word groups, accumulated across is_final segments in
+        # one utterance: [(speaker_tag, text_chunk), ...].
+        self._final_word_groups: list[tuple[str, str]] = []
+        # One-shot diarize health diagnostic — fires on the FIRST final.
+        self._diarize_diag_emitted: bool = False
 
     def open(self, timeout: float = 8.0) -> bool:
         t = threading.Thread(target=self._run, daemon=True)
@@ -93,6 +101,68 @@ class _SpeakerStream:
             #   speech_final = the speaker has actually stopped talking
             speech_final = bool(getattr(msg, "speech_final", False))
             phrase_final = bool(getattr(msg, "is_final", False))
+            # With diarize=True, each word carries a `speaker` field. Find
+            # the dominant speaker in this segment so the controller can map
+            # it to a candidate/interviewer label downstream. Also group
+            # consecutive words by speaker so we can split mixed utterances.
+            dominant_speaker: Optional[str] = None
+            words = getattr(alt, "words", None) or []
+            words_with_speaker = 0
+            unique_speakers: set[str] = set()
+            word_groups: list[tuple[str, list[str]]] = []
+            if words:
+                from collections import Counter
+                speaker_counts: Counter = Counter()
+                current_tag: Optional[str] = None
+                current_words: list[str] = []
+                for w in words:
+                    spk = getattr(w, "speaker", None)
+                    tag = str(spk) if spk is not None else None
+                    word_text = (
+                        getattr(w, "punctuated_word", None) or getattr(w, "word", "") or ""
+                    )
+                    if tag is not None:
+                        words_with_speaker += 1
+                        unique_speakers.add(tag)
+                        speaker_counts[tag] += 1
+                    if tag != current_tag:
+                        if current_tag is not None and current_words:
+                            word_groups.append((current_tag, list(current_words)))
+                        current_tag = tag
+                        current_words = [word_text] if word_text else []
+                    else:
+                        if word_text:
+                            current_words.append(word_text)
+                if current_tag is not None and current_words:
+                    word_groups.append((current_tag, current_words))
+
+                if speaker_counts:
+                    dominant_speaker = speaker_counts.most_common(1)[0][0]
+
+            if dominant_speaker is not None:
+                self._last_diarize_speaker = dominant_speaker
+
+            # One-shot diagnostic on the FIRST is_final to report whether
+            # Deepgram is actually returning per-word speaker IDs.
+            if (getattr(msg, "is_final", False) and not self._diarize_diag_emitted
+                    and self._on_event):
+                self._diarize_diag_emitted = True
+                self._on_event(STTEvent(
+                    text=(
+                        f"[diarize debug] words={len(words)} "
+                        f"with_speaker={words_with_speaker} "
+                        f"unique_speakers={sorted(unique_speakers) or 'none'}"
+                    ),
+                    speaker="_status",
+                    ts_start=time.time(), ts_end=time.time(),
+                    is_final=True, pcm=None,
+                ))
+
+            # If this segment locked in (is_final), append its word_groups
+            # to the per-utterance group buffer. Speech_final will use it.
+            if getattr(msg, "is_final", False) and word_groups:
+                for tag, ws in word_groups:
+                    self._final_word_groups.append((tag, " ".join(ws)))
         except Exception:
             return
 
@@ -120,6 +190,7 @@ class _SpeakerStream:
                 text=self._committed_segments, speaker=self._speaker,
                 ts_start=self._ts_start, ts_end=time.time(),
                 is_final=False, pcm=None,
+                diarize_speaker=self._last_diarize_speaker,
             ))
         else:
             # Pure interim partial — show committed + current in-progress text.
@@ -127,6 +198,7 @@ class _SpeakerStream:
                 text=cumulative, speaker=self._speaker,
                 ts_start=self._ts_start, ts_end=time.time(),
                 is_final=False, pcm=None,
+                diarize_speaker=self._last_diarize_speaker,
             ))
 
     def _flush_as_final(self) -> None:
@@ -140,11 +212,35 @@ class _SpeakerStream:
             return
         pcm = self._get_pcm(self._speaker) or None
         self._clear_pcm(self._speaker)
-        self._on_event(STTEvent(
-            text=text, speaker=self._speaker,
-            ts_start=self._ts_start, ts_end=time.time(),
-            is_final=True, pcm=pcm,
-        ))
+
+        # If we captured per-word speaker IDs across the utterance, split into
+        # per-speaker sub-utterances. Otherwise emit one final with the dominant.
+        groups = self._final_word_groups
+        self._final_word_groups = []
+
+        if groups and len({g[0] for g in groups}) > 1:
+            # Multiple speakers in this utterance — split into chunks.
+            # We don't have per-word PCM slicing (the buffer is contiguous),
+            # so attach the full pcm only to the LARGEST chunk (best chance
+            # for anchor matching). Smaller chunks emit text-only.
+            largest_idx = max(range(len(groups)), key=lambda i: len(groups[i][1]))
+            for i, (tag, chunk_text) in enumerate(groups):
+                if not chunk_text.strip():
+                    continue
+                self._on_event(STTEvent(
+                    text=chunk_text.strip(), speaker=self._speaker,
+                    ts_start=self._ts_start, ts_end=time.time(),
+                    is_final=True,
+                    pcm=(pcm if i == largest_idx else None),
+                    diarize_speaker=tag,
+                ))
+        else:
+            self._on_event(STTEvent(
+                text=text, speaker=self._speaker,
+                ts_start=self._ts_start, ts_end=time.time(),
+                is_final=True, pcm=pcm,
+                diarize_speaker=self._last_diarize_speaker,
+            ))
         self._committed_segments = ""
         self._ts_start = time.time()
 
@@ -170,18 +266,30 @@ class _SpeakerStream:
             # signal we use to trigger Claude. Match it to our local
             # `vad_silence_ms` so the perceived "speaker is done" boundary
             # matches the other engines.
+            # Deepgram-SDK v7 quirk: the flag params (interim_results,
+            # diarize, smart_format, punctuate, vad_events) are typed as
+            # Literal["true", "false"] | Any. The SDK serializes them straight
+            # into the query string, and Python's `True` becomes "True" with
+            # a capital T — which the Deepgram server treats as invalid and
+            # silently DISABLES the flag. Pass lowercase strings to actually
+            # turn these on.
             ctx = self._client.listen.v1.connect(
                 model=self._model,
                 encoding="linear16",
                 sample_rate=16000,
                 channels=1,
-                interim_results=True,
-                smart_format=True,
+                interim_results="true",
+                smart_format="true",
                 language="en-US",
-                punctuate=True,
-                vad_events=False,
+                punctuate="true",
+                vad_events="false",
                 endpointing=300,
                 utterance_end_ms=max(self._endpointing_ms, 1000),
+                # Server-side speaker diarization. Tags each word with a
+                # speaker ID — the controller maps those IDs to candidate /
+                # interviewer once (via the voice anchor) and reuses the
+                # mapping for the rest of the session.
+                diarize="true",
             )
             with ctx as socket:
                 self._socket = socket

@@ -56,6 +56,7 @@ class Segmenter(threading.Thread):
         on_utterance: Optional[Callable[[Utterance], None]] = None,
         on_chunk: Optional[Callable[[Optional[str], bytes, float], None]] = None,
         on_close: Optional[Callable[[Optional[str], float], None]] = None,
+        on_level: Optional[Callable[[int], None]] = None,
         pass_through: bool = False,
     ):
         """
@@ -63,6 +64,7 @@ class Segmenter(threading.Thread):
           on_utterance(Utterance)         — batch mode; full PCM clip at segment close
           on_chunk(speaker, pcm, ts)      — streaming mode; each PCM chunk during speech
           on_close(speaker, ts)           — streaming mode; VAD detected end-of-speech
+          on_level(int 0..100)            — overall mic input level, throttled to ~10 Hz
 
         `pass_through=True` disables local VAD entirely: every audio chunk
         flows to `on_chunk` regardless of speech/silence, and `on_close` /
@@ -76,17 +78,22 @@ class Segmenter(threading.Thread):
         self.on_utterance = on_utterance
         self.on_chunk = on_chunk
         self.on_close = on_close
+        self.on_level = on_level
         self.pass_through = pass_through
         self._stop = threading.Event()
         self._buffers: dict[str, _SpeakerBuffer] = {}
         self._vad = None
         # carry-over raw int16 per speaker key so we can chunk to exactly 512 samples
         self._carry: dict[str, np.ndarray] = {}
+        # Level-meter throttling — only fire on_level ~10 times per second
+        self._last_level_emit: float = 0.0
+        # Watchdog — track time of the first audio chunk we ever process
+        self.first_chunk_at: Optional[float] = None
 
     def _ensure_vad(self):
         if self._vad is None:
-            from silero_vad import load_silero_vad  # type: ignore
-            self._vad = load_silero_vad(onnx=True)
+            from pipeline.onnx_vad import OnnxVAD
+            self._vad = OnnxVAD()
 
     def stop(self) -> None:
         self._stop.set()
@@ -106,6 +113,12 @@ class Segmenter(threading.Thread):
                     # also check for stale buffers that timed out into silence
                     self._flush_idle()
                 continue
+
+            # Record first-chunk-arrival time + emit level meter (every mode).
+            if self.first_chunk_at is None:
+                self.first_chunk_at = time.time()
+            self._emit_level(chunk)
+
             if self.pass_through:
                 # Forward raw audio with no VAD gating — engine handles VAD itself.
                 if self.on_chunk is not None and chunk.pcm:
@@ -115,6 +128,27 @@ class Segmenter(threading.Thread):
                         pass
                 continue
             self._process(chunk)
+
+    def _emit_level(self, chunk: AudioChunk) -> None:
+        """Compute RMS of this PCM chunk and emit on_level at ~10 Hz."""
+        if self.on_level is None or not chunk.pcm:
+            return
+        now = time.time()
+        if now - self._last_level_emit < 0.1:
+            return
+        try:
+            arr = np.frombuffer(chunk.pcm, dtype=np.int16).astype(np.float32)
+            if len(arr) == 0:
+                return
+            rms = float(np.sqrt(np.mean(arr * arr)))
+            # Map RMS to 0..100. Empirically: ~50 = quiet, ~2000 = normal speech,
+            # ~8000 = loud. log scale gives a meter that reads well across that range.
+            import math
+            level = int(min(100, max(0, 20 * math.log10(max(rms, 1.0) / 32.0))))
+            self.on_level(level)
+            self._last_level_emit = now
+        except Exception:
+            pass
 
     # ── per-chunk handling ───────────────────────────────────────────────
     def _process(self, chunk: AudioChunk) -> None:
@@ -149,11 +183,9 @@ class Segmenter(threading.Thread):
                     pass
 
     def _step_vad(self, buf: _SpeakerBuffer, window: np.ndarray, key: str, sr: int, ts: float) -> None:
-        # silero-vad: feed a torch tensor of float32 normalized to [-1, 1]
-        import torch  # type: ignore
-        wav = torch.from_numpy(window.astype(np.float32) / 32768.0)
-        prob = float(self._vad(wav, sr).item())  # type: ignore[misc]
-        is_speech = prob > 0.5
+        # OnnxVAD takes int16 numpy directly — no torch round-trip.
+        prob = self._vad(window, sr)
+        is_speech = prob > self.cfg.vad_threshold
 
         if is_speech:
             if not buf.in_speech:

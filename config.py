@@ -42,10 +42,11 @@ class Config:
     openai_deep_model: str = "gpt-4o"        # used by the "deeper answer" hotkey
 
     # ── STT ───────────────────────────────────────────────────────────────────
-    # "batch"     = faster-whisper utterance-batched (was the only option pre-F2)
     # "whispercpp" = pywhispercpp streaming (partials during speech, CPU-friendly)
-    # "deepgram"  = cloud streaming (lowest latency, requires API key + internet)
-    stt_engine: str = "batch"
+    # "deepgram"   = cloud streaming (lowest latency, requires API key + internet)
+    # (legacy "batch" / faster-whisper was removed in the slim-down — any saved
+    #  config with "batch" is auto-migrated to "whispercpp" at startup.)
+    stt_engine: str = "whispercpp"
     deepgram_api_key: str = ""
     deepgram_model: str = "nova-3"           # nova-3 is current best for english
     # base.en is ~3x faster than small.en on CPU with only a small accuracy
@@ -62,9 +63,21 @@ class Config:
     mic_device_index: int | None = None       # PyAudio input device index; None = default mic
     loopback_device_index: int | None = None  # PyAudio WASAPI loopback index; None = default output loopback
 
+    # ── Network audio (helper-network mode) ───────────────────────────────────
+    # When mode == MODE_HELPER_NETWORK, the receiver connects to the sender
+    # app running on the interview computer over a plain WebSocket. Filled in
+    # by the NetworkConnectDialog at startup and persisted for next launch.
+    network_host: str = ""
+    network_port: int = 8765
+
     # ── VAD ───────────────────────────────────────────────────────────────────
     vad_silence_ms: int = 800                # silence to close a speech segment
     vad_min_speech_ms: int = 500             # discard back-channel "yeah", "mhm"
+    # Silero-vad output probability threshold for "this window is speech".
+    # 0.5 is the model default and works well for direct-mic audio. Lower it
+    # to ~0.35 if you're capturing acoustically (helper-laptop mode, talking
+    # across a desk) and quiet speech gets missed.
+    vad_threshold: float = 0.35
 
     # ── Diarization (single-mic mode) ─────────────────────────────────────────
     auto_label_min_utterances: int = 3       # turns to observe per cluster before locking labels

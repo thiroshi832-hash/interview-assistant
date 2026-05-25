@@ -21,23 +21,30 @@ datas = [
     # the .exe (see `paths.py:icon_path`).
     ("assets/aetherstack-icon.png", "assets"),
     ("assets/aetherstack-icon.ico", "assets"),
+    # silero-vad ONNX file — loaded directly via onnxruntime (no silero-vad
+    # pip package, no torch).
+    ("assets/silero_vad.onnx", "assets"),
 ]
 binaries = []
 hiddenimports = []
 
+# Reduced bundle list — slim build:
+#   removed silero_vad      (replaced with direct onnxruntime + bundled .onnx)
+#   removed faster_whisper  (whisper.cpp via pywhispercpp covers it)
+#   removed ctranslate2     (transitive dep of faster_whisper; gone now)
+# resemblyzer is back in (needed for voice enrollment fingerprinting).
+# Net savings vs the fat build: ~340 MB.
 for pkg in (
-    "silero_vad",
-    "faster_whisper",
     "pywhispercpp",
     "deepgram",
     "resemblyzer",
     "librosa",
-    "ctranslate2",
     "tokenizers",
     "onnxruntime",
     "pyaudiowpatch",
     "openai",
     "anthropic",
+    "websockets",
 ):
     d, b, h = collect_all(pkg)
     datas += d
@@ -58,11 +65,22 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    # Local hooks take precedence over pyinstaller-hooks-contrib. We override
+    # the contrib `hook-webrtcvad.py` because it errors out on `webrtcvad-wheels`.
+    hookspath=["hooks"],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        "webrtcvad",       # resemblyzer dep we deliberately skipped
+        # Slim-build excludes — block faster-whisper / silero-vad-Python
+        # paths only. We KEEP torch + librosa + numba because resemblyzer
+        # (voice fingerprint enrollment) needs them.
+        # NOTE: webrtcvad MUST be bundled (via webrtcvad-wheels) because
+        # resemblyzer.audio imports it at module load time — excluding it
+        # makes `from resemblyzer import VoiceEncoder` ImportError at runtime
+        # which surfaces in the UI as "Voice enrollment isn't available".
+        "faster_whisper", "ctranslate2", "av",
+        "silero_vad",                              # we use the bundled .onnx directly
+        "torchaudio", "torchvision",               # torch is needed, but not the extras
         "matplotlib", "PIL", "tkinter",
         "pytest", "IPython", "jupyter", "notebook",
     ],

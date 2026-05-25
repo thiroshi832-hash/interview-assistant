@@ -16,17 +16,15 @@ from PySide6.QtWidgets import (
 from ui.style import STYLE
 
 
-# Fixed prompt — varied phonemes, ~85 words, ~12 s at natural pace.
+# Fixed prompt — short and varied phonemes. ~38 words, ~15 s at natural pace,
+# comfortably fits in the 18 s recording window.
 PROMPT_TEXT = (
-    "Hello. I am setting up my interview assistant. I will read this short paragraph aloud "
-    "at a natural, conversational pace so the app can learn what my voice sounds like. "
-    "I enjoy solving hard problems, working with thoughtful teammates, and learning new "
-    "skills every week. The quick brown fox jumps over the lazy dog. Five boxing wizards "
-    "jump quickly. When this short recording is finished, the assistant will know it is me "
-    "speaking. I am ready, and I'm beginning to read now."
+    "Hello, I'm setting up the interview assistant. I enjoy solving hard problems "
+    "and learning new skills. The quick brown fox jumps over the lazy dog. "
+    "Five boxing wizards jump quickly. Okay, that should be enough — I'm done."
 )
 
-DURATION_SEC = 12.0
+DURATION_SEC = 18.0
 
 
 class VoiceEnrollDialog(QDialog):
@@ -56,9 +54,9 @@ class VoiceEnrollDialog(QDialog):
         layout.addWidget(title)
 
         hint = QLabel(
-            "Click Start, then read the paragraph below at a natural pace. The app will "
-            "record about 12 seconds — long enough to tell you apart from the interviewer "
-            "during the call. You only do this once, unless you change microphones."
+            "Click Start, then read the paragraph below at a natural pace. Recording "
+            "lasts about 18 seconds, so don't rush — there's room to breathe between "
+            "sentences. You only do this once, unless you change microphones."
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
@@ -85,17 +83,43 @@ class VoiceEnrollDialog(QDialog):
         self.btn_record.setObjectName("primary")
         self.btn_record.setDefault(True)
         self.btn_record.clicked.connect(self._start)
+        # "I'm done" — finishes the recording early once you've read the prompt.
+        self.btn_stop_early = QPushButton("I'm done")
+        self.btn_stop_early.setEnabled(False)
+        self.btn_stop_early.clicked.connect(self._stop_early)
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_skip)
+        btn_row.addWidget(self.btn_stop_early)
         btn_row.addWidget(self.btn_record)
         layout.addLayout(btn_row)
 
         self._tick.connect(self._on_tick)
         self._done.connect(self._on_done)
 
+    def _stop_early(self):
+        if self._recorder is not None:
+            try:
+                self._recorder.finish_early()
+            except Exception:
+                pass
+            self.btn_stop_early.setEnabled(False)
+            self.progress.setFormat("Wrapping up...")
+
     def _start(self):
+        # Pre-flight check: in the slim build, resemblyzer isn't bundled.
+        # Recording would succeed but embedding would silently fail. Better
+        # to tell the user clearly before they read 18 s of text for nothing.
+        try:
+            import resemblyzer  # noqa: F401
+        except ImportError:
+            self.progress.setFormat(
+                "Voice enrollment isn't available in this build — Skip to continue."
+            )
+            self.btn_record.setEnabled(False)
+            return
         self.btn_record.setEnabled(False)
         self.btn_skip.setEnabled(False)
+        self.btn_stop_early.setEnabled(True)
         self.progress.setFormat("Recording... start reading now")
         # Lazy import to avoid pulling pyaudio at app start
         from audio.voice_enroll import VoiceEnroll

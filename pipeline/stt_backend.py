@@ -26,6 +26,11 @@ class STTEvent:
 
     `speaker` is None when the source itself doesn't know who's talking
     (helper-laptop single-mic). Downstream resolves it via the diarizer.
+
+    `diarize_speaker` is the engine's own per-utterance speaker tag when
+    available (e.g. Deepgram's `diarize=True` gives "0", "1", ...). When set,
+    the controller uses it as a stable speaker key — only needs to figure
+    out ONCE per session which tag corresponds to the candidate.
     """
     text: str
     speaker: Optional[str]
@@ -33,6 +38,7 @@ class STTEvent:
     ts_end: float
     is_final: bool
     pcm: Optional[bytes] = None     # only set on finals; used for speaker ID
+    diarize_speaker: Optional[str] = None   # engine-provided speaker tag, if any
 
 
 class STTBackend(ABC):

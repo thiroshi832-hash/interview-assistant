@@ -63,6 +63,22 @@ class InterviewView(QWidget):
         right = QVBoxLayout(right_panel)
         right.setContentsMargins(0, 0, 0, 0)
 
+        # mic-level meter — pulses with input volume. Flat=no audio coming in.
+        mic_row = QHBoxLayout()
+        mic_row.addWidget(QLabel("Mic:"))
+        self.mic_bar = QProgressBar()
+        self.mic_bar.setRange(0, 100)
+        self.mic_bar.setValue(0)
+        self.mic_bar.setTextVisible(False)
+        self.mic_bar.setFixedHeight(10)
+        mic_row.addWidget(self.mic_bar, stretch=1)
+        self.mic_label = QLabel("waiting…")
+        self.mic_label.setMinimumWidth(110)
+        self.mic_label.setObjectName("hint")
+        mic_row.addWidget(self.mic_label)
+        right.addLayout(mic_row)
+        self._apply_mic_color(0)
+
         # health bar at the top
         health_row = QHBoxLayout()
         health_row.addWidget(QLabel("Interview state:"))
@@ -181,13 +197,27 @@ class InterviewView(QWidget):
     @Slot()
     def clear_answer(self):
         self.answer.clear()
+        # New answer just started → reset the scroll to the very top so the
+        # user always reads the beginning first, regardless of how long the
+        # previous answer was.
+        sb = self.answer.verticalScrollBar()
+        sb.setValue(sb.minimum())
 
     @Slot(str)
     def append_answer_chunk(self, text: str):
-        cur = self.answer.textCursor()
+        # Insert at the end of the document WITHOUT touching the visible
+        # viewport. We deliberately don't call `setTextCursor(cur)` here —
+        # that would force Qt to scroll the view so the cursor is visible
+        # (i.e. jump to the bottom), which is exactly what the user does
+        # NOT want during a long streaming answer. Instead we use a
+        # detached cursor for the insert, and clamp the scroll bar back
+        # to the top each chunk so the document growing doesn't drag the
+        # viewport down either.
+        cur = QTextCursor(self.answer.document())
         cur.movePosition(QTextCursor.MoveOperation.End)
         cur.insertText(text)
-        self.answer.setTextCursor(cur)
+        sb = self.answer.verticalScrollBar()
+        sb.setValue(sb.minimum())
 
     @Slot(str)
     def set_status(self, msg: str):
@@ -225,6 +255,20 @@ class InterviewView(QWidget):
         self.health_note.setText(note)
         self._apply_health_color(score)
 
+    @Slot(int)
+    def set_mic_level(self, level: int):
+        level = max(0, min(100, int(level)))
+        self.mic_bar.setValue(level)
+        if level < 5:
+            self.mic_label.setText("silent")
+        elif level < 25:
+            self.mic_label.setText("quiet")
+        elif level < 60:
+            self.mic_label.setText("normal")
+        else:
+            self.mic_label.setText("loud")
+        self._apply_mic_color(level)
+
     # ── font controls ────────────────────────────────────────────────────────
     def set_font_size(self, size: int) -> None:
         self.font_size = max(_MIN_FONT, min(_MAX_FONT, int(size)))
@@ -254,6 +298,28 @@ class InterviewView(QWidget):
 
     def _toggle_transcript(self) -> None:
         self.set_transcript_visible(not self._transcript_visible)
+
+    # ── mic level bar colour ────────────────────────────────────────────────
+    def _apply_mic_color(self, level: int) -> None:
+        # Red for silent (no audio = problem). Yellow for quiet (might miss
+        # words). Green for normal/loud (good).
+        if level < 5:
+            chunk = "#f38ba8"      # red — flat, no audio
+            txt = "#f38ba8"
+        elif level < 25:
+            chunk = "#f9e2af"      # yellow — quiet, may be missed
+            txt = "#f9e2af"
+        elif level < 80:
+            chunk = "#a6e3a1"      # green — normal
+            txt = "#a6e3a1"
+        else:
+            chunk = "#94e2d5"      # teal — loud
+            txt = "#94e2d5"
+        self.mic_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid #45475a; border-radius: 4px; background: #313244; } "
+            f"QProgressBar::chunk {{ background: {chunk}; border-radius: 3px; }}"
+        )
+        self.mic_label.setStyleSheet(f"color: {txt}; font-size: 11px;")
 
     # ── health bar colour ────────────────────────────────────────────────────
     def _apply_health_color(self, score: int) -> None:

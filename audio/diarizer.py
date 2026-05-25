@@ -49,7 +49,17 @@ class Diarizer:
 
     def _ensure_encoder(self):
         if self._encoder is None:
-            from resemblyzer import VoiceEncoder  # type: ignore
+            try:
+                from resemblyzer import VoiceEncoder  # type: ignore
+            except ImportError as e:
+                # Slim build doesn't bundle resemblyzer + torch. Helper-mode
+                # voice fingerprinting is unavailable; callers degrade to the
+                # behavioural AutoLabeler instead.
+                raise RuntimeError(
+                    "Voice fingerprinting isn't available in this build "
+                    "(resemblyzer not bundled). Helper-laptop mode will use "
+                    "behavioural speaker detection instead."
+                ) from e
             self._encoder = VoiceEncoder("cpu")
 
     def _embed(self, pcm_int16: bytes, sample_rate: int) -> Optional[np.ndarray]:

@@ -39,8 +39,15 @@ class VoiceEnroll(threading.Thread):
         self.on_tick = on_tick
         self.on_done = on_done
         self._stop = threading.Event()
+        self._finish_early = threading.Event()
 
     def cancel(self) -> None:
+        """Stop and DISCARD any captured audio (treated as failure)."""
+        self._stop.set()
+
+    def finish_early(self) -> None:
+        """Stop now but USE the captured audio (treated as success if long enough)."""
+        self._finish_early.set()
         self._stop.set()
 
     def run(self) -> None:
@@ -86,7 +93,10 @@ class VoiceEnroll(threading.Thread):
                     except Exception:
                         pass
 
-            if self._stop.is_set() or len(buffer) < 16000 * 3 * 2:
+            # Treat a "finish_early" stop as success if we got enough audio,
+            # but a plain `cancel()` always discards.
+            cancelled_outright = self._stop.is_set() and not self._finish_early.is_set()
+            if cancelled_outright or len(buffer) < 16000 * 3 * 2:
                 # need at least 3 s of audio for a decent embedding (16k * 3 * 2 bytes)
                 emb = None
             else:
@@ -97,6 +107,9 @@ class VoiceEnroll(threading.Thread):
                     raw_emb = encoder.embed_utterance(wav)
                     norm = np.linalg.norm(raw_emb) + 1e-8
                     emb = (raw_emb / norm).astype(np.float32)
+                except ImportError:
+                    # Slim build: voice enrollment isn't available.
+                    emb = None
                 except Exception:
                     emb = None
         finally:

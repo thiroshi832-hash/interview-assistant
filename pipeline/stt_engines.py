@@ -1,13 +1,14 @@
 """
 Concrete STT backends.
 
-BatchBackend     — wraps faster-whisper; one final event per utterance.
-WhisperCppBackend — whisper.cpp via pywhispercpp; partials every ~600 ms
-                    plus a final when the speech segment closes.
+WhisperCppBackend — on-device streaming via whisper.cpp (pywhispercpp).
+DeepgramBackend   — cloud streaming (see pipeline.deepgram_stt).
 
-Both backends do their transcription work on their OWN worker thread,
-so `feed()` and `close_segment()` are non-blocking — the Segmenter never
-gets backed up by slow CPU inference.
+(The faster-whisper "batch" backend was removed in the slim-down — it pulled
+in ctranslate2 + av.libs for ~140 MB of redundancy with whisper.cpp.)
+
+Transcription happens on each backend's own worker thread, so `feed()` and
+`close_segment()` are non-blocking — the Segmenter never gets backed up.
 """
 from __future__ import annotations
 
@@ -20,94 +21,6 @@ import numpy as np
 
 from config import Config
 from pipeline.stt_backend import STTBackend, STTEvent
-
-
-# ── BatchBackend ─────────────────────────────────────────────────────────────
-
-
-class BatchBackend(STTBackend):
-    """
-    Existing path. Buffers per-speaker, transcribes the whole clip with
-    faster-whisper on close_segment, emits a single final.
-    """
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self._model = None
-        self._model_lock = threading.Lock()
-        self._buffers: dict[Optional[str], bytearray] = {}
-        self._segment_start: dict[Optional[str], float] = {}
-        self._on_event: Optional[Callable[[STTEvent], None]] = None
-        self._jobs: queue.Queue = queue.Queue()
-        self._stop_event = threading.Event()
-        self._worker: Optional[threading.Thread] = None
-
-    def _ensure_model(self):
-        if self._model is None:
-            from faster_whisper import WhisperModel  # type: ignore
-            try:
-                self._model = WhisperModel(
-                    self.cfg.whisper_model,
-                    device=self.cfg.whisper_device,
-                    compute_type=self.cfg.whisper_compute,
-                )
-            except (RuntimeError, ValueError):
-                if self.cfg.whisper_device == "cuda" and self.cfg.whisper_compute != "int8":
-                    self.cfg.whisper_compute = "int8"
-                    self.cfg.save()
-                    self._model = WhisperModel(
-                        self.cfg.whisper_model, device="cuda", compute_type="int8",
-                    )
-                else:
-                    raise
-
-    def start(self, on_event):
-        self._on_event = on_event
-        self._ensure_model()
-        self._worker = threading.Thread(target=self._loop, daemon=True)
-        self._worker.start()
-
-    def feed(self, pcm: bytes, speaker, ts: float) -> None:
-        buf = self._buffers.setdefault(speaker, bytearray())
-        if not buf:
-            self._segment_start[speaker] = ts
-        buf.extend(pcm)
-
-    def close_segment(self, speaker, ts: float) -> None:
-        buf = self._buffers.pop(speaker, None)
-        ts_start = self._segment_start.pop(speaker, ts)
-        if not buf:
-            return
-        self._jobs.put((speaker, ts_start, ts, bytes(buf), True))
-
-    def _loop(self):
-        while not self._stop_event.is_set():
-            try:
-                speaker, ts_start, ts_end, pcm, is_final = self._jobs.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            text = self._transcribe(pcm)
-            if text and self._on_event:
-                self._on_event(STTEvent(
-                    text=text, speaker=speaker,
-                    ts_start=ts_start, ts_end=ts_end,
-                    is_final=is_final, pcm=pcm if is_final else None,
-                ))
-
-    def _transcribe(self, pcm: bytes) -> str:
-        wav = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        if len(wav) < 16000 // 2:
-            return ""
-        with self._model_lock:
-            segments, _ = self._model.transcribe(  # type: ignore[union-attr]
-                wav, language="en", vad_filter=False, beam_size=1,
-                condition_on_previous_text=False, without_timestamps=True,
-            )
-            return " ".join(s.text for s in segments).strip()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        self._buffers.clear()
 
 
 # ── WhisperCppBackend ────────────────────────────────────────────────────────
@@ -236,10 +149,13 @@ class WhisperCppBackend(STTBackend):
 
 
 def make_stt_backend(cfg: Config) -> STTBackend:
-    engine = (cfg.stt_engine or "batch").lower()
+    engine = (cfg.stt_engine or "whispercpp").lower()
     if engine in ("deepgram", "cloud"):
         from pipeline.deepgram_stt import DeepgramBackend
         return DeepgramBackend(cfg)
-    if engine in ("whispercpp", "whisper.cpp", "streaming", "whispercpp_streaming"):
-        return WhisperCppBackend(cfg)
-    return BatchBackend(cfg)
+    # Auto-migrate any existing "batch" config to whispercpp (faster-whisper
+    # was removed in the slim-down; whisper.cpp covers the same use case).
+    if engine == "batch":
+        cfg.stt_engine = "whispercpp"
+        cfg.save()
+    return WhisperCppBackend(cfg)

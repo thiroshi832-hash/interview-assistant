@@ -24,9 +24,12 @@ MODELS = [
 
 
 def _is_cuda_available() -> bool:
+    # onnxruntime exposes available execution providers — if CUDA is in there,
+    # the user has cuDNN + CUDA installed. Avoids pulling in ctranslate2 just
+    # for a probe.
     try:
-        import ctranslate2  # type: ignore
-        return ctranslate2.get_cuda_device_count() > 0
+        import onnxruntime as ort  # type: ignore
+        return "CUDAExecutionProvider" in ort.get_available_providers()
     except Exception:
         return False
 
@@ -66,11 +69,12 @@ class SttSettingsDialog(QDialog):
 
         # ── engine dropdown ─────────────────────────────────────────────
         self.cb_engine = QComboBox()
-        self.cb_engine.addItem("faster-whisper (batch, default — on-device)", userData="batch")
         self.cb_engine.addItem("whisper.cpp (streaming — on-device, words during speech)", userData="whispercpp")
         self.cb_engine.addItem("Deepgram (cloud streaming — lowest latency, needs API key)", userData="deepgram")
+        # Migrate legacy saved value
+        current = cfg.stt_engine if cfg.stt_engine != "batch" else "whispercpp"
         for i in range(self.cb_engine.count()):
-            if self.cb_engine.itemData(i) == cfg.stt_engine:
+            if self.cb_engine.itemData(i) == current:
                 self.cb_engine.setCurrentIndex(i)
                 break
         self.cb_engine.currentIndexChanged.connect(self._on_engine_change)

@@ -94,22 +94,18 @@ class ModelPreloader:
         self.llm_warmup = llm_warmup
 
     def _preload_local_whisper(self, engine: str, on_status: StatusFn, on_bytes: BytesFn) -> None:
+        # After the slim-down only whisper.cpp is on-device. "batch" is auto-
+        # migrated to "whispercpp" by the engine factory.
         model_id = self.cfg.whisper_model
-        if engine == "whispercpp":
-            cached = whispercpp_is_cached(model_id)
-            cache_dir = _whispercpp_cache_dir()
-            human_engine = "whisper.cpp"
-        else:
-            cached = whisper_is_cached(model_id)
-            cache_dir = _whisper_cache_dir(model_id)
-            human_engine = "faster-whisper"
+        cached = whispercpp_is_cached(model_id)
+        cache_dir = _whispercpp_cache_dir()
 
         if cached:
-            on_status("stt", f"Loading {human_engine} model ({model_id}) from cache...")
+            on_status("stt", f"Loading whisper.cpp model ({model_id}) from cache...")
         else:
             on_status(
                 "stt",
-                f"Downloading {human_engine} model ({model_id})... "
+                f"Downloading whisper.cpp model ({model_id})... "
                 f"One-time download, happens in the background.",
             )
         poll_stop = threading.Event()
@@ -124,33 +120,14 @@ class ModelPreloader:
             poll_thread.start()
 
         try:
-            if engine == "whispercpp":
-                import io as _io
-                from pywhispercpp.model import Model  # type: ignore
-                Model(
-                    model_id,
-                    print_realtime=False,
-                    print_progress=False,
-                    redirect_whispercpp_logs_to=_io.StringIO(),
-                )
-            else:
-                from faster_whisper import WhisperModel
-                try:
-                    WhisperModel(
-                        self.cfg.whisper_model,
-                        device=self.cfg.whisper_device,
-                        compute_type=self.cfg.whisper_compute,
-                    )
-                except (RuntimeError, ValueError) as e:
-                    # Same fallback as runtime: if float16 fails on GPU
-                    # without cuDNN, retry with int8.
-                    if (self.cfg.whisper_device == "cuda"
-                            and self.cfg.whisper_compute != "int8"):
-                        self.cfg.whisper_compute = "int8"
-                        self.cfg.save()
-                        WhisperModel(self.cfg.whisper_model, device="cuda", compute_type="int8")
-                    else:
-                        raise
+            import io as _io
+            from pywhispercpp.model import Model  # type: ignore
+            Model(
+                model_id,
+                print_realtime=False,
+                print_progress=False,
+                redirect_whispercpp_logs_to=_io.StringIO(),
+            )
         except Exception as e:
             self.error = f"Could not load STT model: {e}"
             return
@@ -167,11 +144,11 @@ class ModelPreloader:
             if self.error or self.cancel.is_set():
                 return
 
-        # 2) Silero VAD (small download, no progress UI needed)
+        # 2) ONNX-runtime silero-vad — bundled file, no download.
         on_status("vad", "Loading voice activity detector...")
         try:
-            from silero_vad import load_silero_vad
-            load_silero_vad(onnx=True)
+            from pipeline.onnx_vad import OnnxVAD
+            OnnxVAD()
         except Exception as e:
             self.error = f"Could not load VAD: {e}"
             return

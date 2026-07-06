@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 
 from audio.auto_labeler import AutoLabeler
+from pipeline.context_summary import ContextSummarizer
 from pipeline.echo_filter import is_echo
 from pipeline.interview_health import compute_health
 from pipeline.license import (
@@ -257,6 +258,70 @@ def test_trial_countdown() -> None:
     assert days_remaining(now - 100 * 86400, now=now) == 0
     assert not trial_expired(now - 5 * 86400, now=now)
     assert trial_expired(now - (TRIAL_DAYS + 1) * 86400, now=now)
+
+
+def _turns(n: int, start_ts: float = 1.0) -> list[Turn]:
+    out = []
+    for i in range(n):
+        speaker = "interviewer" if i % 2 == 0 else "candidate"
+        out.append(Turn(speaker=speaker, text=f"turn {i}", ts=start_ts + i))
+    return out
+
+
+def test_context_summary_no_pending_within_window() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(5)
+    assert cs.pending_turns(turns, keep_last=8) == []
+    assert cs.should_update(turns, keep_last=8, batch_size=6) is False
+
+
+def test_context_summary_pending_only_turns_older_than_window() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(12)  # 4 older than an 8-turn window
+    pending = cs.pending_turns(turns, keep_last=8)
+    assert [t.text for t in pending] == ["turn 0", "turn 1", "turn 2", "turn 3"]
+
+
+def test_context_summary_should_update_respects_batch_size() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(12)  # 4 aged out
+    assert cs.should_update(turns, keep_last=8, batch_size=6) is False
+    turns = _turns(14)  # 6 aged out
+    assert cs.should_update(turns, keep_last=8, batch_size=6) is True
+
+
+def test_context_summary_apply_update_advances_cursor() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(14)
+    pending = cs.pending_turns(turns, keep_last=8)
+    assert len(pending) == 6
+    cs.apply_update(pending, "The candidate discussed X and Y.")
+    assert cs.summary == "The candidate discussed X and Y."
+    # Those 6 turns are folded now — same snapshot yields nothing new.
+    assert cs.pending_turns(turns, keep_last=8) == []
+
+
+def test_context_summary_folded_turns_survive_growth_and_dont_repeat() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(14)
+    first_batch = cs.pending_turns(turns, keep_last=8)
+    cs.apply_update(first_batch, "summary so far")
+
+    # More turns arrive; only the newly-aged-out ones should be pending —
+    # the already-folded ones must not reappear even though list indices shift.
+    grown = _turns(20)
+    pending = cs.pending_turns(grown, keep_last=8)
+    assert [t.text for t in pending] == ["turn 6", "turn 7", "turn 8", "turn 9", "turn 10", "turn 11"]
+
+
+def test_context_summary_reset_clears_state() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(14)
+    cs.apply_update(cs.pending_turns(turns, keep_last=8), "summary")
+    cs.reset()
+    assert cs.summary == ""
+    assert cs.pending_turns(turns, keep_last=8) == cs.pending_turns(turns, keep_last=8)
+    assert len(cs.pending_turns(turns, keep_last=8)) == 6
 
 
 def main() -> int:

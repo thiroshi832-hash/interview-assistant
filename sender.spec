@@ -22,11 +22,13 @@ binaries = []
 hiddenimports = []
 
 # Only what the sender actually uses.
-# PySide6 MUST be in this list — without it PyInstaller misses the Qt
-# platform plugins (platforms\qwindows.dll, etc.), and a windowed-mode
-# build will silently fail to create any window at runtime ("the app
-# shows a taskbar icon but no main window").
-for pkg in ("PySide6", "shiboken6", "pyaudiowpatch", "websockets"):
+# NOTE: do NOT collect_all("PySide6") — that force-pulls EVERY Qt module
+# (QtWebEngine, Qt3D, QtCharts, QtMultimedia, QtQml…), and the QtWebEngine
+# hook crashes the build (FileNotFoundError writing qt.conf). The sender only
+# imports QtCore/QtGui/QtWidgets; PyInstaller's standard PySide6 hook collects
+# those plus the platform plugins (qwindows.dll) automatically — same as
+# app.spec does. Heavy unused Qt modules are excluded below for good measure.
+for pkg in ("pyaudiowpatch", "websockets"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -68,6 +70,21 @@ a = Analysis(
         "pytest", "IPython", "jupyter", "notebook",
         "sklearn", "scikit-learn",
         "pypdf", "docx", "python-docx",
+        # Heavy Qt modules the sender never uses. Excluding them keeps the
+        # bundle small and guarantees the crashing QtWebEngine hook never runs.
+        "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebEngineQuick", "PySide6.QtWebChannel",
+        "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuick3D",
+        "PySide6.QtQuickControls2", "PySide6.QtQuickWidgets",
+        "PySide6.Qt3DCore", "PySide6.Qt3DRender", "PySide6.Qt3DExtras",
+        "PySide6.Qt3DInput", "PySide6.Qt3DLogic", "PySide6.Qt3DAnimation",
+        "PySide6.QtCharts", "PySide6.QtDataVisualization", "PySide6.QtGraphs",
+        "PySide6.QtGraphsWidgets", "PySide6.QtMultimedia",
+        "PySide6.QtMultimediaWidgets", "PySide6.QtSpatialAudio",
+        "PySide6.QtPdf", "PySide6.QtPdfWidgets", "PySide6.QtDesigner",
+        "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtPositioning",
+        "PySide6.QtLocation", "PySide6.QtSql", "PySide6.QtOpenGL",
+        "PySide6.QtOpenGLWidgets",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

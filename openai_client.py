@@ -14,6 +14,7 @@ from typing import Iterator, Sequence
 from openai import OpenAI
 
 from config import Config
+from pipeline.context_summary import build_update_prompt
 from pipeline.evaluation import (
     EVALUATION_SCHEMA, EVALUATION_USER_PROMPT, InterviewEvaluation,
     format_transcript,
@@ -149,18 +150,30 @@ class OpenAIClient:
         except Exception:
             pass
 
+    # ── running context summary (see pipeline/context_summary.py) ─────────────
+    def summarize(self, prior_summary: str, new_turns: Sequence[Turn]) -> str:
+        """Same contract as ClaudeClient.summarize() — see there for why."""
+        response = self._client.chat.completions.create(
+            model=self.cfg.openai_model,
+            max_tokens=300,
+            messages=[{"role": "user", "content": build_update_prompt(prior_summary, new_turns)}],
+            temperature=0.3,
+        )
+        return (response.choices[0].message.content or "").strip()
+
     def stream_answer(
         self,
         turns: Sequence[Turn],
         *,
         deep: bool = False,
         style_hint: str = "",
+        summary: str = "",
     ) -> Iterator[str]:
         if not self._resume_text:
             raise RuntimeError("Call set_context() with the resume before requesting an answer.")
 
         system = self._build_system()
-        user = self._build_user(turns, style_hint=style_hint)
+        user = self._build_user(turns, style_hint=style_hint, summary=summary)
         model = self.cfg.openai_deep_model if deep else self.cfg.openai_model
 
         stream = self._client.chat.completions.create(
@@ -206,7 +219,7 @@ class OpenAIClient:
             )
         return f"{SYSTEM_RULES}\n\n{role_block}\n\n{resume_block}{personal_block}"
 
-    def _build_user(self, turns: Sequence[Turn], *, style_hint: str = "") -> str:
+    def _build_user(self, turns: Sequence[Turn], *, style_hint: str = "", summary: str = "") -> str:
         if not turns:
             return "Provide a brief self-introduction in the candidate's voice based on the resume."
 
@@ -216,8 +229,12 @@ class OpenAIClient:
             lines.append(f"[{label}] {t.text.strip()}")
         transcript = "\n".join(lines)
         hint = f"\n\nStyle override for this answer: {style_hint}." if style_hint else ""
+        summary_block = (
+            f"Summary of the interview before the excerpt below:\n{summary}\n\n" if summary else ""
+        )
 
         return (
+            f"{summary_block}"
             f"Conversation so far:\n\n{transcript}\n\n"
             "Answer the LAST interviewer turn above. If the candidate has already started "
             "speaking in response, continue from where they left off; otherwise produce "

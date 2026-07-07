@@ -120,13 +120,18 @@ class ModelPreloader:
             poll_thread.start()
 
         try:
-            import io as _io
             from pywhispercpp.model import Model  # type: ignore
             Model(
                 model_id,
                 print_realtime=False,
                 print_progress=False,
-                redirect_whispercpp_logs_to=_io.StringIO(),
+                # `None` -> pywhispercpp redirects to a real os.devnull file
+                # (has a valid OS file descriptor). An in-memory io.StringIO()
+                # doesn't, and current pywhispercpp does an OS-level fd dup2
+                # onto it (it only checks hasattr(stream, "fileno"), which is
+                # True for StringIO even though calling it raises), crashing
+                # with io.UnsupportedOperation: fileno.
+                redirect_whispercpp_logs_to=None,
             )
         except Exception as e:
             self.error = f"Could not load STT model: {e}"

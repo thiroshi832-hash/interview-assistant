@@ -13,6 +13,7 @@ from typing import Iterator, Sequence
 import anthropic
 
 from config import Config
+from pipeline.context_summary import build_update_prompt
 from pipeline.evaluation import (
     EVALUATION_SCHEMA, EVALUATION_USER_PROMPT, InterviewEvaluation,
     format_transcript,
@@ -155,6 +156,27 @@ class ClaudeClient:
                 error=f"Evaluation failed: {e}",
             )
 
+    # ── running context summary (see pipeline/context_summary.py) ─────────────
+    def summarize(self, prior_summary: str, new_turns: Sequence[Turn]) -> str:
+        """
+        Fold `new_turns` (aged out of the rolling transcript window) into a
+        compact running summary, so later answers stay consistent with the
+        whole interview without resending it verbatim every time. Cheap
+        model, low effort, small max_tokens — called off the live-answer
+        path, never blocks a `stream_answer()` call.
+        """
+        response = self._client.messages.create(
+            model=self.cfg.model,
+            max_tokens=300,
+            messages=[{"role": "user", "content": build_update_prompt(prior_summary, new_turns)}],
+            output_config={"effort": "low"},
+        )
+        text = next(
+            (b.text for b in response.content if getattr(b, "type", None) == "text"),
+            "",
+        )
+        return text.strip()
+
     # ── per-question ─────────────────────────────────────────────────────────
     def stream_answer(
         self,
@@ -162,6 +184,7 @@ class ClaudeClient:
         *,
         deep: bool = False,
         style_hint: str = "",
+        summary: str = "",
     ) -> Iterator[str]:
         """
         Yield text chunks of the answer as Claude streams it.
@@ -171,12 +194,14 @@ class ClaudeClient:
 
         `deep=True` swaps to the deep-mode model (Opus 4.7 by default).
         `style_hint` is appended to nudge length/tone, e.g. "shorter" or "more technical".
+        `summary` is the running summary of everything older than `turns` — see
+        pipeline/context_summary.py. Empty string if there's nothing to summarize yet.
         """
         if not self._resume_text:
             raise RuntimeError("Call set_context() with the resume before requesting an answer.")
 
         system = self._build_system_blocks()
-        user_message = self._build_user_message(turns, style_hint=style_hint)
+        user_message = self._build_user_message(turns, style_hint=style_hint, summary=summary)
         model = self.cfg.deep_model if deep else self.cfg.model
 
         with self._client.messages.stream(
@@ -220,7 +245,7 @@ class ClaudeClient:
             },
         ]
 
-    def _build_user_message(self, turns: Sequence[Turn], *, style_hint: str = "") -> str:
+    def _build_user_message(self, turns: Sequence[Turn], *, style_hint: str = "", summary: str = "") -> str:
         if not turns:
             return "Provide a brief self-introduction in the candidate's voice based on the resume."
 
@@ -232,8 +257,12 @@ class ClaudeClient:
 
         transcript = "\n".join(lines)
         hint = f"\n\nStyle override for this answer: {style_hint}." if style_hint else ""
+        summary_block = (
+            f"Summary of the interview before the excerpt below:\n{summary}\n\n" if summary else ""
+        )
 
         return (
+            f"{summary_block}"
             f"Conversation so far:\n\n{transcript}\n\n"
             "Answer the LAST interviewer turn above. If the candidate has already started "
             "speaking in response, continue from where they left off; otherwise produce "

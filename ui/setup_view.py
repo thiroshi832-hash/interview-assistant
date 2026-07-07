@@ -27,6 +27,7 @@ class SetupView(QWidget):
         super().__init__()
         self.cfg = cfg
         self._resume_text: str = ""
+        self._resume_filename: str = ""
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(20, 20, 20, 20)
@@ -108,14 +109,28 @@ class SetupView(QWidget):
 
         outer.addWidget(resume_box)
 
+        # Restore the resume from the last session so the user isn't forced
+        # to re-upload it every launch.
+        if cfg.resume_text:
+            self._resume_text = cfg.resume_text
+            self._resume_filename = cfg.resume_filename
+            self.txt_preview.setPlainText(cfg.resume_text)
+            self.lbl_status.setText(
+                f"Restored: {cfg.resume_filename or 'previous resume'}  ({len(cfg.resume_text)} chars)"
+            )
+
         # ── job ──
         job_box = QGroupBox("Role")
         form = QFormLayout(job_box)
         self.in_title = QLineEdit()
         self.in_title.setPlaceholderText("e.g. Senior Backend Engineer")
+        if cfg.job_title:
+            self.in_title.setText(cfg.job_title)
         self.in_jd = QPlainTextEdit()
         self.in_jd.setPlaceholderText("Paste the job description (optional but recommended).")
         self.in_jd.setMinimumHeight(120)
+        if cfg.job_description:
+            self.in_jd.setPlainText(cfg.job_description)
         form.addRow("Job title:", self.in_title)
         form.addRow("Description:", self.in_jd)
         outer.addWidget(job_box)
@@ -164,6 +179,7 @@ class SetupView(QWidget):
             QMessageBox.warning(self, "Could not load resume", str(e))
             return
         self._resume_text = text
+        self._resume_filename = Path(path).name
         self.txt_preview.setPlainText(text)
         self.lbl_status.setText(f"Loaded: {Path(path).name}  ({len(text)} chars)")
 
@@ -173,7 +189,12 @@ class SetupView(QWidget):
             QMessageBox.warning(self, "Need a resume", "Load a resume before starting.")
             return
         personal = self.in_personal.toPlainText().strip()
-        # Persist personal context so the user doesn't retype it each session.
+        # Persist so the setup screen restores this session's resume/role/
+        # personal context next launch instead of starting blank.
+        self.cfg.resume_text = resume
+        self.cfg.resume_filename = self._resume_filename
+        self.cfg.job_title = self.in_title.text().strip()
+        self.cfg.job_description = self.in_jd.toPlainText().strip()
         self.cfg.personal_context = personal
         self.cfg.save()
         self.ready.emit(

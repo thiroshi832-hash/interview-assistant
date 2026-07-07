@@ -91,13 +91,23 @@ class Config:
     question_silence_ms: int = 1200          # interviewer-finished-talking heuristic (silence-net trigger)
 
     # ── Conversation context ──────────────────────────────────────────────────
-    rolling_turns: int = 8                   # how many prior turns to send to Claude
+    rolling_turns: int = 8                   # how many prior turns to send to Claude verbatim
+    # Turns older than `rolling_turns` are folded into a running summary
+    # (pipeline/context_summary.py) instead of being dropped outright, so the
+    # model keeps some memory of the whole interview at ~constant per-answer
+    # cost. This batches how many aged-out turns accumulate before paying for
+    # one (cheap) summarization call, instead of updating on every turn.
+    summary_fold_batch: int = 6
 
     # ── UI ────────────────────────────────────────────────────────────────────
     answer_font_size: int = 16               # pixels; the A− / A+ buttons persist here
     transcript_collapsed: bool = False
 
     # ── Interview metadata (filled in by the UI before "Start") ───────────────
+    # Persisted so the setup screen restores the last session's resume/role
+    # instead of starting blank every launch.
+    resume_text: str = ""
+    resume_filename: str = ""        # display-only, for the "Restored: ..." label
     job_title: str = ""
     job_description: str = ""
     # Personal context the resume doesn't cover — salary expectations, start date,

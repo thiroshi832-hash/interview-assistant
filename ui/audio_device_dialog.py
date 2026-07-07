@@ -11,13 +11,19 @@ from config import Config
 from ui.style import STYLE
 
 
-def _device_label(info: dict[str, Any]) -> str:
+def _device_label(info: dict[str, Any], host_api_name: str = "") -> str:
     name = str(info.get("name", "Unknown device"))
     index = int(info.get("index", -1))
     rate = int(float(info.get("defaultSampleRate", 0) or 0))
+    # Windows exposes the same physical device once per host API (MME,
+    # DirectSound, WASAPI, WDM-KS) — identical-looking entries that can
+    # behave very differently (some flood non-real-time garbage instead of
+    # pacing real audio). Show the API so users can tell them apart, and
+    # prefer WASAPI when duplicates exist (see _populate_combo).
+    api_suffix = f", {host_api_name}" if host_api_name else ""
     if rate:
-        return f"{name}  (#{index}, {rate} Hz)"
-    return f"{name}  (#{index})"
+        return f"{name}  (#{index}, {rate} Hz{api_suffix})"
+    return f"{name}  (#{index}{api_suffix})"
 
 
 class AudioDeviceDialog(QDialog):
@@ -44,7 +50,9 @@ class AudioDeviceDialog(QDialog):
 
         hint = QLabel(
             "Pick the microphone for your voice and the Windows loopback device "
-            "that carries the interviewer's audio."
+            "that carries the interviewer's audio. If the same mic is listed more "
+            "than once, prefer the \"Windows WASAPI\" entry — some virtual-audio "
+            "setups expose broken duplicates under other APIs."
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
@@ -106,10 +114,29 @@ class AudioDeviceDialog(QDialog):
 
             pa = pyaudio.PyAudio()
             try:
+                host_api_names: dict[int, str] = {}
+
+                def host_api_name(host_api_index: int) -> str:
+                    if host_api_index not in host_api_names:
+                        try:
+                            host_api_names[host_api_index] = str(
+                                pa.get_host_api_info_by_index(host_api_index).get("name", "")
+                            )
+                        except Exception:
+                            host_api_names[host_api_index] = ""
+                    return host_api_names[host_api_index]
+
                 for i in range(pa.get_device_count()):
                     info = pa.get_device_info_by_index(i)
                     if int(info.get("maxInputChannels", 0) or 0) > 0:
+                        info["_host_api_name"] = host_api_name(int(info.get("hostApi", -1)))
                         self._inputs.append(info)
+                # The same physical mic is often exposed once per Windows audio
+                # host API (MME, DirectSound, WASAPI, WDM-KS) under an
+                # identical-looking name. Some of those duplicates don't
+                # actually pace audio in real time. WASAPI is the modern,
+                # reliable one — list it first so it's the natural pick.
+                self._inputs.sort(key=lambda info: info.get("_host_api_name") != "Windows WASAPI")
                 try:
                     self._loopbacks = list(pa.get_loopback_device_info_generator())  # type: ignore[attr-defined]
                 except Exception:
@@ -130,7 +157,7 @@ class AudioDeviceDialog(QDialog):
         combo.addItem(default_label, userData=None)
         for info in devices:
             index = int(info.get("index", -1))
-            combo.addItem(_device_label(info), userData=index)
+            combo.addItem(_device_label(info, info.get("_host_api_name", "")), userData=index)
             if selected is not None and index == selected:
                 combo.setCurrentIndex(combo.count() - 1)
 

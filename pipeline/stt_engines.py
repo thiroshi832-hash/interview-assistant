@@ -62,14 +62,17 @@ class WhisperCppBackend(STTBackend):
     def _ensure_model(self):
         if self._model is None:
             from pywhispercpp.model import Model  # type: ignore
-            # pywhispercpp later calls `.write()` on `redirect_whispercpp_logs_to`
-            # — `False` and `None` both break. Give it a real discarding buffer.
-            import io as _io
+            # `None` -> pywhispercpp redirects to a real os.devnull file (has
+            # a valid OS file descriptor). Passing an in-memory io.StringIO()
+            # crashes on current pywhispercpp: it checks hasattr(stream,
+            # "fileno") to decide whether to do an OS-level fd dup2 onto the
+            # stream, and StringIO has that method (inherited from IOBase) —
+            # it just raises io.UnsupportedOperation when actually called.
             self._model = Model(
                 self.cfg.whisper_model,
                 print_realtime=False,
                 print_progress=False,
-                redirect_whispercpp_logs_to=_io.StringIO(),
+                redirect_whispercpp_logs_to=None,
             )
 
     def start(self, on_event):

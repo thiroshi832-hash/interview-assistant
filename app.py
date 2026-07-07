@@ -34,6 +34,7 @@ from audio.single_mic import SingleMicSource
 from audio.source import AudioSource
 from config import Config
 from llm_provider import make_client
+from pipeline.context_summary import ContextSummarizer
 from pipeline.echo_filter import is_echo
 from pipeline.filler import pick_opener
 from pipeline.interview_health import compute_health
@@ -141,6 +142,11 @@ class App(QObject):
         self.transcript = Transcript()
         self.qdetect = QuestionDetector()
         self.llm = make_client(cfg)
+        # Running summary of turns older than the rolling window (see
+        # pipeline/context_summary.py) — keeps answers consistent across a
+        # long interview without resending the full transcript every time.
+        self._summarizer = ContextSummarizer()
+        self._summarizing = False
 
         # Subscribe to transcript updates so we emit `turn_update` whenever
         # the transcript changes (partial or final, replaced or new).
@@ -479,6 +485,8 @@ class App(QObject):
         except Exception:
             pass
 
+        self._maybe_update_summary()
+
         if speaker == "candidate":
             self._candidate_speaking_until = event.ts_end + CANDIDATE_GRACE_SEC
             self._candidate_spoke_since_answer = True
@@ -500,6 +508,34 @@ class App(QObject):
     def _on_transcript_change(self, turn, replaced_partial: bool) -> None:
         """Transcript listener — forward partial+final updates to the UI."""
         self.turn_update.emit(turn.speaker, turn.text, turn.is_final, replaced_partial)
+
+    # ── running context summary ─────────────────────────────────────────────
+    def _maybe_update_summary(self) -> None:
+        """
+        Kick a background summary update once enough finalized turns have
+        aged out of the rolling window (`cfg.rolling_turns`) to be worth
+        folding in. Batched (cfg.summary_fold_batch) and async so it never
+        adds latency to a live answer — see pipeline/context_summary.py.
+        """
+        if self._summarizing:
+            return
+        finals = self.transcript.snapshot_finalized()
+        if not self._summarizer.should_update(finals, self.cfg.rolling_turns, self.cfg.summary_fold_batch):
+            return
+        pending = self._summarizer.pending_turns(finals, self.cfg.rolling_turns)
+        self._summarizing = True
+        threading.Thread(target=self._summary_worker, args=(pending,), daemon=True).start()
+
+    def _summary_worker(self, pending) -> None:
+        try:
+            updated = self.llm.summarize(self._summarizer.summary, pending)
+            self._summarizer.apply_update(pending, updated)
+        except Exception:
+            # Non-critical — those turns stay pending and get retried once
+            # more turns age in past them.
+            pass
+        finally:
+            self._summarizing = False
 
     # ── Claude streaming ─────────────────────────────────────────────────
     def _launch_answer(self, *, deep: bool = False, style_hint: str = "", with_filler: bool = True) -> None:
@@ -531,7 +567,9 @@ class App(QObject):
 
         turns = self.transcript.snapshot()
         try:
-            for chunk in self.llm.stream_answer(turns, deep=deep, style_hint=style_hint):
+            for chunk in self.llm.stream_answer(
+                turns, deep=deep, style_hint=style_hint, summary=self._summarizer.summary,
+            ):
                 if self._answer_cancel.is_set():
                     return
                 self.answer_chunk.emit(chunk)

@@ -40,21 +40,23 @@ $env:ANTHROPIC_API_KEY = "sk-ant-..."   # for Claude
 $env:OPENAI_API_KEY = "sk-..."          # for GPT
 ```
 
-## Run
+## Run (from source — no build needed while developing)
 
 ```powershell
-cd "C:\repositories\interview assistant"
-python app.py
+.\run.bat
 ```
 
-## Build a single-file `.exe`
+(equivalent to `python app.py`). The companion Sender app (helper-network mode) has its own `.\run_sender.bat`. Both run straight from source — no PyInstaller step required to test a change.
+
+## Build a distributable `.exe`
 
 ```powershell
-pip install pyinstaller
-pyinstaller app.spec --clean --noconfirm
+.\build.bat
 ```
 
-Output: `dist\interview-assistant.exe` (~360 MB, no Python install needed to run).
+(equivalent to `pyinstaller --noconfirm app.spec`). `.\build_sender.bat` builds the Sender app from `sender.spec`.
+
+Output: `dist\aetherstack-interview-assistant\` (onedir build, no Python install needed to run).
 
 First launch of the .exe takes ~10–20 s while it extracts to a temp dir; subsequent launches are faster. Model weights (Whisper, silero-vad, Resemblyzer) are still downloaded to the user's home dir on first use — they are not bundled.
 

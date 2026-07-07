@@ -82,7 +82,11 @@ class Segmenter(threading.Thread):
         self.pass_through = pass_through
         self._stop = threading.Event()
         self._buffers: dict[str, _SpeakerBuffer] = {}
-        self._vad = None
+        # Silero-VAD is STATEFUL (persistent LSTM state), so each concurrent
+        # speaker stream needs its OWN instance — sharing one across mic and
+        # loopback lets their audio corrupt each other's VAD state and
+        # clip/merge/miss speech. Keyed by speaker.
+        self._vads: dict[str, object] = {}
         # carry-over raw int16 per speaker key so we can chunk to exactly 512 samples
         self._carry: dict[str, np.ndarray] = {}
         # Level-meter throttling — only fire on_level ~10 times per second
@@ -90,10 +94,14 @@ class Segmenter(threading.Thread):
         # Watchdog — track time of the first audio chunk we ever process
         self.first_chunk_at: Optional[float] = None
 
-    def _ensure_vad(self):
-        if self._vad is None:
+    def _get_vad(self, key: str):
+        """One stateful OnnxVAD per speaker key (created on first use)."""
+        vad = self._vads.get(key)
+        if vad is None:
             from pipeline.onnx_vad import OnnxVAD
-            self._vad = OnnxVAD()
+            vad = OnnxVAD()
+            self._vads[key] = vad
+        return vad
 
     def stop(self) -> None:
         self._stop.set()
@@ -103,8 +111,8 @@ class Segmenter(threading.Thread):
         return any(buf.in_speech for buf in self._buffers.values())
 
     def run(self) -> None:
-        if not self.pass_through:
-            self._ensure_vad()
+        # VAD instances are created lazily per speaker in _step_vad; the
+        # onnxruntime model is already warmed by the model preloader.
         while not self._stop.is_set():
             try:
                 chunk: AudioChunk = self.source.queue.get(timeout=0.1)
@@ -183,8 +191,9 @@ class Segmenter(threading.Thread):
                     pass
 
     def _step_vad(self, buf: _SpeakerBuffer, window: np.ndarray, key: str, sr: int, ts: float) -> None:
-        # OnnxVAD takes int16 numpy directly — no torch round-trip.
-        prob = self._vad(window, sr)
+        # OnnxVAD takes int16 numpy directly — no torch round-trip. Per-speaker
+        # instance so each stream keeps its own VAD state.
+        prob = self._get_vad(key)(window, sr)
         is_speech = prob > self.cfg.vad_threshold
 
         if is_speech:

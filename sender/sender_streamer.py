@@ -225,7 +225,10 @@ class SenderStreamer:
         # Mic stream → tag 0x01 (candidate)
         mic_info = self._get_input_device(self._mic_idx)
         mic_rate = int(mic_info["defaultSampleRate"])
-        mic_channels = min(int(mic_info["maxInputChannels"]), 1) or 1
+        # Open at native channel count and downmix in software (the reader's
+        # to_mono_16k_int16 handles channels > 1). Forcing PortAudio to mono on
+        # a natively-stereo/virtual mic produces energetic-but-garbled audio.
+        mic_channels = int(mic_info["maxInputChannels"]) or 1
         self._mic_stream = self._pa.open(
             format=pyaudio.paInt16,
             channels=mic_channels,

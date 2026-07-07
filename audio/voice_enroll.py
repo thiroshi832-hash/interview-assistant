@@ -33,11 +33,15 @@ class VoiceEnroll(threading.Thread):
         duration_sec: float = 12.0,
         on_tick: Optional[Callable[[float], None]] = None,
         on_done: Optional[Callable[[Optional[np.ndarray]], None]] = None,
+        device_index: Optional[int] = None,
     ):
         super().__init__(daemon=True)
         self.duration_sec = float(duration_sec)
         self.on_tick = on_tick
         self.on_done = on_done
+        # Record from the SAME mic the interview will use, so the enrolled
+        # fingerprint matches what's captured live. None → system default.
+        self.device_index = device_index
         self._stop = threading.Event()
         self._finish_early = threading.Event()
 
@@ -56,9 +60,20 @@ class VoiceEnroll(threading.Thread):
         stream = None
         try:
             pa = pyaudio.PyAudio()
-            mic_info = pa.get_default_input_device_info()
+            mic_info = None
+            if self.device_index is not None:
+                try:
+                    info = pa.get_device_info_by_index(int(self.device_index))
+                    if int(info.get("maxInputChannels", 0) or 0) > 0:
+                        mic_info = info
+                except Exception:
+                    mic_info = None
+            if mic_info is None:
+                mic_info = pa.get_default_input_device_info()
             rate = int(mic_info["defaultSampleRate"])
-            channels = min(int(mic_info["maxInputChannels"]), 1) or 1
+            # Native channels + software downmix (to_mono_16k_int16), matching
+            # the capture path — forced mono garbles some virtual devices.
+            channels = int(mic_info["maxInputChannels"]) or 1
             stream = pa.open(
                 format=pyaudio.paInt16,
                 channels=channels,

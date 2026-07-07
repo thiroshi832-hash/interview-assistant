@@ -20,7 +20,7 @@ class MainWindow(QMainWindow):
         # Let the window shrink well below the content's natural size so it can
         # be made short on small laptop screens (content scrolls / clips rather
         # than pinning a tall minimum the user can't drag past).
-        self.setMinimumSize(640, 400)
+        self.setMinimumSize(640, 200)
         self._restore_geometry()
 
         self.stack = QStackedWidget()
@@ -72,7 +72,7 @@ class MainWindow(QMainWindow):
             avail = screen.availableGeometry()
             w = min(w, avail.width())
             h = min(h, avail.height())
-        self.resize(max(w, 640), max(h, 400))
+        self.resize(max(w, 640), max(h, 200))
         if screen is not None:
             fg = self.frameGeometry()
             fg.moveCenter(avail.center())

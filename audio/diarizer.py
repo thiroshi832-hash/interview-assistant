@@ -74,6 +74,30 @@ class Diarizer:
             return None
         return raw / (np.linalg.norm(raw) + 1e-8)
 
+    @property
+    def anchor(self) -> Optional[np.ndarray]:
+        """The unit-norm candidate anchor embedding, or None if not enrolled."""
+        return self._anchor
+
+    def embed(self, pcm_int16: bytes, sample_rate: int = 16000) -> Optional[np.ndarray]:
+        """Public: unit-norm voice embedding for a clip, or None if too short."""
+        return self._embed(pcm_int16, sample_rate)
+
+    def anchor_similarity(self, pcm_int16: bytes, sample_rate: int = 16000) -> Optional[float]:
+        """
+        Cosine similarity of this clip's voice to the enrolled candidate anchor,
+        in [-1, 1]. None if the clip is too short to embed. Callers compare
+        similarities RELATIVELY (which speaker is closest to the anchor) rather
+        than against a fixed threshold — a different speaker can still exceed
+        any absolute cutoff, but the relative gap between speakers is reliable.
+        """
+        if self._anchor is None:
+            raise RuntimeError("Diarizer.anchor_similarity() requires a candidate_anchor")
+        emb = self._embed(pcm_int16, sample_rate)
+        if emb is None:
+            return None
+        return float(np.dot(emb, self._anchor))
+
     def assign_labeled(self, pcm_int16: bytes, sample_rate: int = 16000) -> Optional[str]:
         """
         Anchor mode: directly classify as "candidate" or "interviewer" by

@@ -79,6 +79,17 @@ class Config:
     # across a desk) and quiet speech gets missed.
     vad_threshold: float = 0.35
 
+    # ── Mic noise gate (same-laptop / helper-network) ─────────────────────────
+    # The mic should carry only the candidate, who speaks directly into it.
+    # The interviewer's audio leaks in acoustically at much lower volume; a
+    # finalized "candidate" utterance whose PEAK level (loudest ~100 ms window)
+    # is below this floor is treated as that bleed and dropped. Peak — not mean
+    # — because Deepgram's buffer can accumulate long silences that dilute a
+    # mean, wrongly dropping real speech. Faint bleed peaks stay low (a few
+    # hundred); real speech peaks reach the thousands. Lower it if your own
+    # speech gets dropped; raise it if faint interviewer bleed still slips in.
+    mic_gate_rms: int = 600
+
     # ── Diarization (single-mic mode) ─────────────────────────────────────────
     auto_label_min_utterances: int = 3       # turns to observe per cluster before locking labels
 

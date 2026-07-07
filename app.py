@@ -133,20 +133,25 @@ class App(QObject):
         # no AutoLabeler needed.
         self.diarizer = None
         self.auto_labeler = None
-        if mode == MODE_HELPER:
-            anchor = (
-                np.asarray(cfg.candidate_voice_embedding, dtype=np.float32)
-                if cfg.candidate_voice_embedding else None
-            )
-            try:
+        anchor = (
+            np.asarray(cfg.candidate_voice_embedding, dtype=np.float32)
+            if cfg.candidate_voice_embedding else None
+        )
+        try:
+            if anchor is not None:
+                # Enrolled voice → anchor diarizer in EVERY mode: it labels by
+                # voice in helper-acoustic, and powers the voice bleed-filter in
+                # same-laptop / helper-network (drop mic audio that's actually
+                # the interviewer's voice). Channel-based labeling is unchanged.
                 self.diarizer = Diarizer(candidate_anchor=anchor)
-            except Exception:
-                # resemblyzer not bundled (slim build). Fall back to the
-                # heuristic auto-labeler — works without voice fingerprint.
-                self.diarizer = None
-                anchor = None
-            if anchor is None:
-                self.auto_labeler = AutoLabeler(cfg.auto_label_min_utterances)
+            elif mode == MODE_HELPER:
+                self.diarizer = Diarizer(candidate_anchor=None)
+        except Exception:
+            # resemblyzer not importable (slim build). Degrade gracefully.
+            self.diarizer = None
+            anchor = None
+        if mode == MODE_HELPER and anchor is None:
+            self.auto_labeler = AutoLabeler(cfg.auto_label_min_utterances)
 
         # ── language pipeline ─────────────────────────────────────────────
         self.transcript = Transcript()
@@ -165,6 +170,10 @@ class App(QObject):
         # diarization is on but never producing per-word speaker IDs.
         self._finals_seen_without_diarize: int = 0
         self._diarize_warning_emitted: bool = False
+        # Helper-acoustic anchor mode: running voice-similarity-to-anchor per
+        # Deepgram speaker tag. The tag closest to the enrolled recording is
+        # the candidate (relative comparison — see _resolve_by_voice).
+        self._tag_sim: dict[str, float] = {}
 
         # ── threading ─────────────────────────────────────────────────────
         self._answer_thread: threading.Thread | None = None
@@ -339,6 +348,58 @@ class App(QObject):
         """Segmenter callback — VAD detected end-of-speech for this speaker."""
         self.stt.close_segment(speaker, ts)
 
+    @staticmethod
+    def _clip_peak_rms(pcm: bytes, sr: int) -> float:
+        """
+        Peak loudness of a clip: the 95th-percentile RMS across 100 ms windows.
+        Robust to long silences padding the buffer (which would sink a plain
+        mean) — real speech shows loud windows, faint bleed does not.
+        """
+        arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        if arr.size == 0:
+            return 0.0
+        w = max(1, int(sr * 0.1))
+        n = arr.size // w
+        if n == 0:
+            return float(np.sqrt(np.mean(arr * arr)))
+        win = arr[: n * w].reshape(n, w)
+        rms = np.sqrt(np.mean(win * win, axis=1))
+        return float(np.percentile(rms, 95))
+
+    def _resolve_by_voice(self, event: STTEvent, tag: Optional[str]) -> str:
+        """
+        Helper-acoustic speaker labeling by voice similarity to the enrolled
+        candidate recording — purely RELATIVE, no absolute threshold (the same
+        person's similarity varies too much across clips for any fixed cutoff
+        to be reliable).
+
+        Track each Deepgram speaker tag's running similarity to the anchor. The
+        candidate is whichever tag is CLOSEST to the recording, among the
+        speakers heard so far:
+          - one voice heard  → it's the closest by default → candidate
+          - two+ voices      → the closer one is candidate, the rest interviewer
+
+        Partials / clips too short to embed keep the last known speaker. If the
+        cold-start guess is wrong (e.g. the interviewer speaks first, before the
+        candidate has been heard), it self-corrects once the candidate speaks;
+        the Swap button is the manual override.
+        """
+        last = getattr(self, "_helper_last_speaker", "interviewer")
+        if not event.is_final or not event.pcm:
+            return last
+        try:
+            sim = self.diarizer.anchor_similarity(event.pcm, self.cfg.sample_rate)
+        except Exception:
+            sim = None
+        if sim is None:
+            return last  # too short/quiet to embed — keep last speaker
+        key = tag if tag is not None else "_"
+        prev = self._tag_sim.get(key)
+        # EMA per tag: stable, but adapts if a tag's similarity drifts.
+        self._tag_sim[key] = sim if prev is None else 0.6 * prev + 0.4 * sim
+        candidate_key = max(self._tag_sim, key=self._tag_sim.get)
+        return "candidate" if key == candidate_key else "interviewer"
+
     def _on_stt_event(self, event: STTEvent) -> None:
         """
         STT backend callback. Fires from the backend's worker thread for
@@ -348,6 +409,14 @@ class App(QObject):
         """
         text = event.text.strip()
         if not text:
+            return
+
+        # Diagnostic/status events (Deepgram diarize-debug, connection errors)
+        # are for the UI status line only — route them there and DON'T store
+        # them as transcript turns, or they'd be sent to the LLM as candidate
+        # context and pollute answers.
+        if event.speaker == "_status":
+            self.status.emit(text)
             return
 
         # ── Resolve speaker ───────────────────────────────────────────────
@@ -369,7 +438,19 @@ class App(QObject):
             speaker = None
             tag = event.diarize_speaker
 
-            if tag is not None:
+            # Anchor mode (candidate voice enrolled): decide who's who by
+            # RELATIVE voice similarity to the enrolled recording, not a fixed
+            # cutoff. Deepgram separates distinct voices into speaker tags; for
+            # each tag we track how close its voice is to the recording, and the
+            # tag CLOSEST to the recording is the candidate. A fixed threshold
+            # is unreliable both ways: the same person's similarity varies a lot
+            # across clips, and a different person can still score high — so only
+            # the relative ordering between the speakers present is trustworthy.
+            anchor_mode = self.diarizer is not None and self.diarizer.has_anchor
+            if anchor_mode:
+                speaker = self._resolve_by_voice(event, tag)
+
+            if not anchor_mode and tag is not None:
                 # Lazy-init the diarize-tag → label map.
                 if not hasattr(self, "_dg_speaker_map"):
                     self._dg_speaker_map: dict[str, str] = {}
@@ -435,7 +516,7 @@ class App(QObject):
 
             # Watchdog: if Deepgram finals keep coming with no speaker tag at
             # all, diarization isn't actually running. Warn the user once.
-            if event.is_final and tag is None and self.cfg.stt_engine == "deepgram":
+            if not anchor_mode and event.is_final and tag is None and self.cfg.stt_engine == "deepgram":
                 self._finals_seen_without_diarize += 1
                 if (self._finals_seen_without_diarize >= 3
                         and not self._diarize_warning_emitted):
@@ -447,10 +528,12 @@ class App(QObject):
                         "Labels will use a best-effort default; use Swap if wrong."
                     )
 
-            # Path 2 (fallback): no diarize tag, or still nothing decided.
+            # Fallback: partial (no PCM), a clip too short to embed, or — in
+            # non-anchor mode — no diarize tag. Keep the last known speaker;
+            # in non-anchor mode, try clustering / auto-labeler.
             if speaker is None:
                 speaker = getattr(self, "_helper_last_speaker", "interviewer")
-                if event.is_final and event.pcm and self.diarizer is not None:
+                if not anchor_mode and event.is_final and event.pcm and self.diarizer is not None:
                     try:
                         if self.diarizer.has_anchor:
                             label = self.diarizer.assign_labeled(event.pcm, self.cfg.sample_rate)
@@ -468,25 +551,31 @@ class App(QObject):
             if getattr(self, "_same_laptop_swap", False):
                 speaker = "interviewer" if speaker == "candidate" else "candidate"
 
+        # Helper-acoustic + enrolled voice: partials carry no PCM, so they
+        # can't be voice-fingerprinted. Showing a guessed-speaker partial that
+        # the voice-matched final then relabels leaves duplicate lines under
+        # both speakers. Only display voice-matched finals in this mode.
+        if (event.speaker is None and not event.is_final
+                and self.diarizer is not None and self.diarizer.has_anchor):
+            return
+
         # Track interviewer voice activity (partials AND finals) for the echo
         # guard below.
         if speaker == "interviewer":
             self._interviewer_voice_until = time.time() + INTERVIEWER_ECHO_GUARD_SEC
 
-        # ── Echo suppression (candidate partials AND finals) ──────────────
-        # The mic can pick up the interviewer's audio (acoustic, or digital
-        # via a virtual-audio mixer). Distinguish that bleed from the
-        # candidate's real voice by whether the mic TEXT matches what the
-        # interviewer is concurrently saying — NOT by a blunt time gate, which
-        # also silences the candidate's genuine answers whenever the
-        # interviewer channel happens to be active.
-        #   1) Text overlap with recent interviewer speech (incl. the
-        #      in-progress partial via snapshot()) → bleed. Runs on partials
-        #      too, so bleed never flashes on screen as a candidate turn.
-        #   2) Sub-threshold fragments is_echo can't score (< 5 words): while
-        #      the interviewer is actively speaking, a 1-4 word candidate blip
-        #      is almost certainly bleed of a word or two, not a real answer.
-        if speaker == "candidate":
+        # ── Candidate/mic bleed suppression (channel modes) ───────────────
+        # In same-laptop / helper-network the mic should carry only the
+        # candidate, who speaks directly into it (loud). The interviewer's audio
+        # leaks in acoustically at LOW volume — measured ~10-15x quieter than
+        # direct speech (bleed rms < ~300 vs direct rms in the thousands). A
+        # microphone noise gate drops that faint bleed while keeping real
+        # speech. `event.speaker is not None` ⇒ channel mode (not helper).
+        if speaker == "candidate" and event.speaker is not None:
+            if event.is_final and event.pcm:
+                if self._clip_peak_rms(event.pcm, self.cfg.sample_rate) < self.cfg.mic_gate_rms:
+                    return  # peak too faint to be the candidate → interviewer bleed
+            # Backup text-overlap echo filter (catches any louder echo).
             recent = self.transcript.snapshot()[-16:]
             if is_echo(text, recent, candidate_ts=event.ts_end):
                 return
@@ -669,14 +758,14 @@ def main() -> int:
     # no enrollment needed. We only show the dialog if the user hasn't
     # enrolled before.
     if mode == MODE_HELPER and not cfg.candidate_voice_embedding:
-        ve = VoiceEnrollDialog()
+        ve = VoiceEnrollDialog(device_index=cfg.mic_device_index)
         ve.exec()  # user may Skip; either way we proceed
         if ve.embedding is not None:
             cfg.candidate_voice_embedding = [float(x) for x in ve.embedding]
             cfg.save()
 
     # 3) main window
-    win = MainWindow(cfg)
+    win = MainWindow(cfg, mode)
     win.show()
 
     controller: App | None = None

@@ -10,15 +10,16 @@ from ui.style import STYLE
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, mode: str = ""):
         super().__init__()
         self.cfg = cfg
+        self.mode = mode
         self.setWindowTitle("AetherStack Interview Assistant")
         self.setStyleSheet(STYLE)
         self.resize(1280, 760)
 
         self.stack = QStackedWidget()
-        self.setup_view = SetupView(cfg)
+        self.setup_view = SetupView(cfg, mode)
         self.interview_view = InterviewView()
         # Restore persisted UI preferences
         self.interview_view.set_font_size(cfg.answer_font_size)

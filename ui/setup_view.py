@@ -14,6 +14,7 @@ from pipeline.license import days_remaining, is_valid_license
 from resume_loader import load_resume
 from ui.api_key_dialog import ApiKeyDialog
 from ui.audio_device_dialog import AudioDeviceDialog
+from ui.mode_picker import MODE_HELPER
 from ui.stt_settings_dialog import SttSettingsDialog
 from ui.voice_enroll_dialog import VoiceEnrollDialog
 
@@ -23,9 +24,10 @@ class SetupView(QWidget):
 
     ready = Signal(str, str, str, str)   # resume, job_title, job_description, personal_context
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, mode: str = ""):
         super().__init__()
         self.cfg = cfg
+        self.mode = mode
         self._resume_text: str = ""
         self._resume_filename: str = ""
 
@@ -243,6 +245,10 @@ class SetupView(QWidget):
             if self.cfg.mic_device_index is not None
             else "default mic"
         )
+        if self.mode == MODE_HELPER:
+            # One mic hears both speakers; no loopback in this mode.
+            self.lbl_audio.setText(f"Helper-laptop audio: {mic} (single mic, voice-distinguished)")
+            return
         loopback = (
             f"loopback #{self.cfg.loopback_device_index}"
             if self.cfg.loopback_device_index is not None
@@ -256,12 +262,12 @@ class SetupView(QWidget):
             self._refresh_stt_label()
 
     def _audio_settings(self) -> None:
-        dlg = AudioDeviceDialog(self.cfg)
+        dlg = AudioDeviceDialog(self.cfg, single_device=(self.mode == MODE_HELPER))
         if dlg.exec() == dlg.DialogCode.Accepted:
             self._refresh_audio_label()
 
     def _reenroll_voice(self) -> None:
-        dlg = VoiceEnrollDialog()
+        dlg = VoiceEnrollDialog(device_index=self.cfg.mic_device_index)
         if dlg.exec() != dlg.DialogCode.Accepted or dlg.embedding is None:
             return
         self.cfg.candidate_voice_embedding = [float(x) for x in dlg.embedding]

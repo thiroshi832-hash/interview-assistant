@@ -54,6 +54,12 @@ for pkg in (
 hiddenimports += collect_submodules("scipy.signal")
 hiddenimports += collect_submodules("scipy.special")
 hiddenimports += collect_submodules("librosa")
+# scipy.signal imports its vendored array_api_compat at load time; without this
+# the frozen app crashes with "No module named
+# 'scipy._external.array_api_compat.numpy.fft'". Collect both possible vendored
+# locations (older scipy: _lib, newer: _external); a missing one yields [].
+hiddenimports += collect_submodules("scipy._lib.array_api_compat")
+hiddenimports += collect_submodules("scipy._external.array_api_compat")
 
 
 block_cipher = None

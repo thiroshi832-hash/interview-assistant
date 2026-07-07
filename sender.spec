@@ -35,6 +35,13 @@ for pkg in ("PySide6", "shiboken6", "pyaudiowpatch", "websockets"):
 # scipy.signal for the resampler in audio/_pcm.py
 hiddenimports += collect_submodules("scipy.signal")
 hiddenimports += collect_submodules("scipy.special")
+# scipy.signal imports its vendored array_api_compat at load time; PyInstaller's
+# scipy hook doesn't fully collect it, so the frozen app crashes with e.g.
+# "No module named 'scipy._external.array_api_compat.numpy.fft'". Collect both
+# possible vendored locations (older scipy: _lib, newer: _external); a missing
+# one yields [] harmlessly.
+hiddenimports += collect_submodules("scipy._lib.array_api_compat")
+hiddenimports += collect_submodules("scipy._external.array_api_compat")
 
 
 block_cipher = None

@@ -104,6 +104,10 @@ class Config:
     transcript_collapsed: bool = False
 
     # ── Interview metadata (filled in by the UI before "Start") ───────────────
+    # Persisted so the setup screen restores the last session's resume/role
+    # instead of starting blank every launch.
+    resume_text: str = ""
+    resume_filename: str = ""        # display-only, for the "Restored: ..." label
     job_title: str = ""
     job_description: str = ""
     # Personal context the resume doesn't cover — salary expectations, start date,

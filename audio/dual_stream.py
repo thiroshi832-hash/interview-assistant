@@ -40,7 +40,13 @@ class DualStreamSource(AudioSource):
         # ── mic stream ────────────────────────────────────────────────────
         mic_info = self._get_input_device(self.cfg.mic_device_index)
         mic_rate = int(mic_info["defaultSampleRate"])
-        mic_channels = min(int(mic_info["maxInputChannels"]), 1) or 1
+        # Open at the device's NATIVE channel count and downmix to mono in
+        # software (to_mono_16k_int16 handles channels > 1). Forcing PortAudio
+        # to deliver channels=1 from a natively-stereo device produces
+        # energetic-but-garbled audio on some virtual-audio drivers
+        # (e.g. SteelSeries Sonar) — the waveform has normal RMS but STT can't
+        # decode a single word. The loopback stream below already does this.
+        mic_channels = int(mic_info["maxInputChannels"]) or 1
         self._mic_stream = self._pa.open(
             format=pyaudio.paInt16,
             channels=mic_channels,

@@ -52,14 +52,15 @@ class Transcript:
         replaced = False
         with self._lock:
             existing = self._pending.get(speaker)
-            if existing is not None and existing in self._turns:
-                # Replace in-place
-                idx = list(self._turns).index(existing)
-                # deque doesn't support direct assignment; rebuild
-                new_deque: Deque[Turn] = deque(maxlen=self._turns.maxlen)
-                for i, t in enumerate(self._turns):
-                    new_deque.append(turn if i == idx else t)
-                self._turns = new_deque
+            # Only replace in place if this speaker's pending turn is still the
+            # MOST RECENT turn. If turns from someone else arrived after it, the
+            # conversation moved on and that pending is stale — appending a new
+            # turn keeps the transcript in chronological order. (Replacing a
+            # stale pending in place resurrects it out of order at its old
+            # position, e.g. a never-finalized bleed fragment getting
+            # overwritten by the candidate's later real speech.)
+            if existing is not None and self._turns and self._turns[-1] is existing:
+                self._turns[-1] = turn
                 replaced = True
             else:
                 self._turns.append(turn)
@@ -79,15 +80,13 @@ class Transcript:
         """
         text = text.strip()
         if not text:
-            # If there's a pending partial but the final is empty, drop it
+            # Empty final cancels the in-progress turn — but only if it's still
+            # the active tail. A stale pending (conversation moved past it)
+            # stays frozen where it chronologically belongs.
             with self._lock:
                 pending = self._pending.pop(speaker, None)
-                if pending is not None and pending in self._turns:
-                    new_deque: Deque[Turn] = deque(maxlen=self._turns.maxlen)
-                    for t in self._turns:
-                        if t is not pending:
-                            new_deque.append(t)
-                    self._turns = new_deque
+                if pending is not None and self._turns and self._turns[-1] is pending:
+                    self._turns.pop()
             return None
         turn = Turn(
             speaker=speaker,
@@ -98,12 +97,11 @@ class Transcript:
         replaced = False
         with self._lock:
             existing = self._pending.pop(speaker, None)
-            if existing is not None and existing in self._turns:
-                idx = list(self._turns).index(existing)
-                new_deque: Deque[Turn] = deque(maxlen=self._turns.maxlen)
-                for i, t in enumerate(self._turns):
-                    new_deque.append(turn if i == idx else t)
-                self._turns = new_deque
+            # Same rule as update_partial: finalize in place only if the
+            # pending is still the most recent turn; otherwise append so a
+            # stale pending isn't resurrected out of order.
+            if existing is not None and self._turns and self._turns[-1] is existing:
+                self._turns[-1] = turn
                 replaced = True
             else:
                 self._turns.append(turn)

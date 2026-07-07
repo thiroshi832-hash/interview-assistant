@@ -36,6 +36,37 @@ def test_transcript_ignores_empty() -> None:
     assert t.snapshot() == []
 
 
+def test_transcript_stale_partial_does_not_reorder() -> None:
+    # A candidate partial that never finalizes (e.g. an interviewer-bleed
+    # blip) must not be resurrected out of order when the candidate later
+    # really speaks. The real speech should append at the END, after the
+    # interviewer turn that arrived in between — not overwrite the stale
+    # partial at its old (earlier) position.
+    t = Transcript()
+    t.update_partial("candidate", "Continuing", ts=1.0)          # stray, never finalizes
+    t.commit("interviewer", "Continuing from the safeguards, can you...", ts=2.0)
+    t.update_partial("candidate", "So for a follow-up strategy", ts=3.0)   # real speech
+
+    texts = [(s.speaker, s.text) for s in t.snapshot()]
+    # Real candidate speech is last, in chronological order.
+    assert texts[-1] == ("candidate", "So for a follow-up strategy"), texts
+    # The interviewer turn precedes the candidate's real speech.
+    intv_idx = texts.index(("interviewer", "Continuing from the safeguards, can you..."))
+    cand_idx = len(texts) - 1
+    assert intv_idx < cand_idx, texts
+
+
+def test_transcript_active_partial_still_replaces_in_place() -> None:
+    # Normal case: consecutive partials from the same active speaker replace
+    # in place (no duplicate lines) as long as nothing else interleaves.
+    t = Transcript()
+    t.update_partial("candidate", "So for", ts=1.0)
+    t.update_partial("candidate", "So for a follow-up", ts=1.5)
+    t.commit("candidate", "So for a follow-up strategy.", ts=2.0)
+    texts = [(s.speaker, s.text) for s in t.snapshot()]
+    assert texts == [("candidate", "So for a follow-up strategy.")], texts
+
+
 def test_question_detector_question_mark() -> None:
     qd = QuestionDetector()
     turn = Turn(speaker="interviewer", text="What's your strongest skill?", ts=1.0)

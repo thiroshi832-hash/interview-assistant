@@ -29,7 +29,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = io.StringIO()
 
-from PySide6.QtCore import Qt, Signal, QObject
+from PySide6.QtCore import Qt, Signal, QObject, QSharedMemory
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
@@ -208,12 +208,13 @@ class SenderTrayApp(QObject):
 
         # ── Tray icon ────────────────────────────────────────────────────
         self.tray = QSystemTrayIcon()
-        try:
-            self.tray.setIcon(QIcon(icon_path("png")))
-        except Exception:
-            # Fallback: blank icon better than nothing
-            self.tray.setIcon(self.qt_app.style().standardIcon(
-                self.qt_app.style().StandardPixmap.SP_MediaPlay))
+        # A null QIcon (bad path) yields an INVISIBLE tray icon with no error —
+        # so check isNull() explicitly rather than trusting a try/except.
+        icon = QIcon(icon_path("png"))
+        if icon.isNull():
+            icon = self.qt_app.style().standardIcon(
+                self.qt_app.style().StandardPixmap.SP_MediaPlay)
+        self.tray.setIcon(icon)
         self.tray.setToolTip("AetherStack Sender — idle")
         self.tray.activated.connect(self._on_tray_activated)
 
@@ -250,13 +251,17 @@ class SenderTrayApp(QObject):
         self.tray.setContextMenu(self.menu)
         self.tray.show()
 
-        # Hello bubble so the user can see where the icon lives.
+        # Hello bubble so the user can see where the icon lives. On Windows 11
+        # new tray icons are hidden in the overflow flyout by default, so point
+        # the user at the "show hidden icons" arrow — otherwise the app looks
+        # like it never started.
         self.tray.showMessage(
-            "AetherStack Sender",
-            "Running in the system tray. Right-click the icon for "
-            "Start / Settings / Quit.",
+            "AetherStack Sender is running",
+            "It lives in the system tray. On Windows 11 click the ^ "
+            "\"show hidden icons\" arrow near the clock to find it, then "
+            "right-click for Start / Settings / Quit.",
             QSystemTrayIcon.MessageIcon.Information,
-            4000,
+            6000,
         )
 
     # ── Tray interactions ────────────────────────────────────────────────
@@ -379,6 +384,23 @@ def main() -> int:
                 "Enable tray icons in Windows settings and try again.",
             )
             return 1
+
+        # Single-instance guard. The tray icon hides in Windows 11's overflow
+        # flyout, so a user who can't see it tends to relaunch — piling up
+        # invisible, unkillable processes. Detect an existing instance and tell
+        # them where to look instead of starting another one. (Held for the
+        # process lifetime via a module global so it isn't garbage-collected.)
+        global _instance_lock
+        _instance_lock = QSharedMemory("AetherStackSender-singleton")
+        if not _instance_lock.create(1):
+            QMessageBox.information(
+                None, "AetherStack Sender",
+                "AetherStack Sender is already running.\n\n"
+                "Its icon is in the system tray — on Windows 11 click the ^ "
+                "\"show hidden icons\" arrow near the clock to see it, then "
+                "right-click for Start / Settings / Quit.",
+            )
+            return 0
 
         app = SenderTrayApp(qt_app)  # noqa: F841 — kept alive by Qt
         return qt_app.exec()

@@ -1,6 +1,7 @@
 """Main window: holds the setup view, then swaps to the interview view."""
 from __future__ import annotations
 
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QMainWindow, QStackedWidget
 
 from config import Config
@@ -16,7 +17,11 @@ class MainWindow(QMainWindow):
         self.mode = mode
         self.setWindowTitle("AetherStack Interview Assistant")
         self.setStyleSheet(STYLE)
-        self.resize(1280, 760)
+        # Let the window shrink well below the content's natural size so it can
+        # be made short on small laptop screens (content scrolls / clips rather
+        # than pinning a tall minimum the user can't drag past).
+        self.setMinimumSize(640, 400)
+        self._restore_geometry()
 
         self.stack = QStackedWidget()
         self.setup_view = SetupView(cfg, mode)
@@ -55,3 +60,30 @@ class MainWindow(QMainWindow):
 
     def show_setup(self):
         self.stack.setCurrentWidget(self.setup_view)
+
+    # ── window geometry persistence ──────────────────────────────────────────
+    def _restore_geometry(self) -> None:
+        """Restore the saved size, clamped to the current screen so the window
+        (and its bottom resize grip) always fits — then center it."""
+        w = int(self.cfg.window_width or 1280)
+        h = int(self.cfg.window_height or 760)
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            w = min(w, avail.width())
+            h = min(h, avail.height())
+        self.resize(max(w, 640), max(h, 400))
+        if screen is not None:
+            fg = self.frameGeometry()
+            fg.moveCenter(avail.center())
+            self.move(fg.topLeft())
+
+    def closeEvent(self, event) -> None:
+        # Persist the height/width the user settled on for next launch.
+        self.cfg.window_width = self.width()
+        self.cfg.window_height = self.height()
+        try:
+            self.cfg.save()
+        except Exception:
+            pass
+        super().closeEvent(event)

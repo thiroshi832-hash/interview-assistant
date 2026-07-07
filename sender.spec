@@ -34,6 +34,30 @@ for pkg in ("pyaudiowpatch", "websockets"):
     binaries += b
     hiddenimports += h
 
+# ── MS Visual C++ runtime DLLs ────────────────────────────────────────────
+# Qt6Core.dll depends on MSVCP140.dll. PyInstaller classifies MSVCP140.dll as a
+# "system" DLL and skips bundling it unless some collected package forces it in.
+# In app.spec that happens by accident (torch/sklearn ship their own copies); in
+# this slim sender build every such package is excluded, so MSVCP140.dll is left
+# out entirely. The .exe then runs on any machine that already has the VC++
+# redistributable (or a Python install) — because MSVCP140.dll sits in
+# System32 there — but on a CLEAN machine the loader can't resolve it and the
+# process dies before Python even starts (no crash log, no dialog). Fix: copy
+# the VC runtime DLLs that ship inside the PySide6 wheel into the bundle root
+# AND next to the Qt DLLs, matching app.spec's (accidentally-working) layout.
+import os as _os
+import PySide6 as _pyside6
+_pyside6_dir = _os.path.dirname(_pyside6.__file__)
+for _dll in (
+    "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+    "msvcp140_codecvt_ids.dll", "vcomp140.dll",
+    "vcruntime140.dll", "vcruntime140_1.dll",
+):
+    _src = _os.path.join(_pyside6_dir, _dll)
+    if _os.path.exists(_src):
+        binaries.append((_src, "."))
+        binaries.append((_src, "PySide6"))
+
 # scipy.signal for the resampler in audio/_pcm.py
 hiddenimports += collect_submodules("scipy.signal")
 hiddenimports += collect_submodules("scipy.special")

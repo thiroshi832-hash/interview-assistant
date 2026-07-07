@@ -28,7 +28,11 @@ class Config:
 
     # ── Provider ──────────────────────────────────────────────────────────────
     provider: str = "anthropic"              # "anthropic" or "openai"
-    max_tokens: int = 2048
+    # Backstop cap on a single live answer. The SYSTEM_RULES prompt is what
+    # actually shapes answer length (kept short/plain); this just prevents a
+    # runaway. 768 leaves ample headroom for a "Deeper"/"More technical" answer
+    # without letting the default answer sprawl.
+    max_tokens: int = 768
 
     # ── Anthropic ─────────────────────────────────────────────────────────────
     anthropic_api_key: str = ""
@@ -113,6 +117,10 @@ class Config:
     # ── UI ────────────────────────────────────────────────────────────────────
     answer_font_size: int = 16               # pixels; the A− / A+ buttons persist here
     transcript_collapsed: bool = False
+    # Persisted main-window size. Restored (clamped to the screen) on launch and
+    # saved on close, so the height you set sticks between sessions.
+    window_width: int = 1280
+    window_height: int = 760
 
     # ── Interview metadata (filled in by the UI before "Start") ───────────────
     # Persisted so the setup screen restores the last session's resume/role

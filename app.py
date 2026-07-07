@@ -474,24 +474,23 @@ class App(QObject):
             self._interviewer_voice_until = time.time() + INTERVIEWER_ECHO_GUARD_SEC
 
         # ── Echo suppression (candidate partials AND finals) ──────────────
-        # Runs on partials too, so interviewer bleed never even flashes on
-        # screen as a candidate turn (the old finals-only filter let partials
-        # display, then dropped the final — the "shows as both then removes"
-        # flicker). Two signals:
-        #   1) Half-duplex guard: while the interviewer is (or was just)
-        #      audibly speaking, any candidate audio is bleed — the candidate
-        #      answers after the question, not over it. Catches short bleed
-        #      fragments the text filter can't (too few words to match).
-        #   2) Text overlap with recent interviewer speech (incl. the
-        #      in-progress partial via snapshot()) — catches echo just outside
-        #      the activity window.
+        # The mic can pick up the interviewer's audio (acoustic, or digital
+        # via a virtual-audio mixer). Distinguish that bleed from the
+        # candidate's real voice by whether the mic TEXT matches what the
+        # interviewer is concurrently saying — NOT by a blunt time gate, which
+        # also silences the candidate's genuine answers whenever the
+        # interviewer channel happens to be active.
+        #   1) Text overlap with recent interviewer speech (incl. the
+        #      in-progress partial via snapshot()) → bleed. Runs on partials
+        #      too, so bleed never flashes on screen as a candidate turn.
+        #   2) Sub-threshold fragments is_echo can't score (< 5 words): while
+        #      the interviewer is actively speaking, a 1-4 word candidate blip
+        #      is almost certainly bleed of a word or two, not a real answer.
         if speaker == "candidate":
-            if time.time() <= self._interviewer_voice_until:
+            recent = self.transcript.snapshot()[-16:]
+            if is_echo(text, recent, candidate_ts=event.ts_end):
                 return
-            if is_echo(
-                text, self.transcript.snapshot()[-16:],
-                candidate_ts=event.ts_end,
-            ):
+            if len(text.split()) < 5 and time.time() <= self._interviewer_voice_until:
                 return
 
         # ── Update transcript (partial or final) ─────────────────────────

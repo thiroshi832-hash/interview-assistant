@@ -456,9 +456,15 @@ class App(QObject):
                 speaker = "interviewer" if speaker == "candidate" else "candidate"
 
         # ── Echo filter (finals only) ────────────────────────────────────
+        # Compare against snapshot() (includes the interviewer's IN-PROGRESS
+        # partial), not snapshot_finalized(). During a long interviewer turn
+        # the mic's acoustic echo of the tail often finalizes before the
+        # interviewer turn commits (the mic + loopback Deepgram streams commit
+        # independently), so the matching interviewer turn isn't finalized yet.
+        # The in-progress partial's ts is recent, so it passes the lag gate.
         if event.is_final and speaker == "candidate":
             if is_echo(
-                text, self.transcript.snapshot_finalized()[-12:],
+                text, self.transcript.snapshot()[-16:],
                 candidate_ts=event.ts_end,
             ):
                 return

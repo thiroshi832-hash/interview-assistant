@@ -200,6 +200,25 @@ def test_echo_filter_respects_lag_window() -> None:
     assert is_echo(same_text, [old], candidate_ts=110.0) is False
 
 
+def test_echo_filter_catches_echo_during_in_progress_interviewer_turn() -> None:
+    # Long interviewer turn still in progress (not yet committed): its text
+    # lives in snapshot() as a partial but NOT in snapshot_finalized(). The
+    # mic's acoustic echo of the tail finalizes before the interviewer turn
+    # commits. The filter must catch it — which only works when it compares
+    # against the full snapshot (the app.py fix), not finalized turns only.
+    t = Transcript()
+    t.update_partial(
+        "interviewer",
+        "tell me about a time you had to scale a distributed system under heavy load",
+        ts=100.0,
+    )
+    echo_text = "scale a distributed system under heavy load"
+    # Finalized-only (the old behavior) can't see the in-progress turn:
+    assert is_echo(echo_text, t.snapshot_finalized(), candidate_ts=100.3) is False
+    # Full snapshot (the fix) correctly flags the echo:
+    assert is_echo(echo_text, t.snapshot(), candidate_ts=100.3) is True
+
+
 def test_health_no_turns() -> None:
     h = compute_health([])
     assert h.score == 70 and h.label == "waiting"

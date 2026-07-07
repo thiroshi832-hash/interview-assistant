@@ -60,6 +60,16 @@ from ui.voice_enroll_dialog import VoiceEnrollDialog
 # something longer than typical thinking-pause-mid-answer.
 CANDIDATE_GRACE_SEC = 4.0
 
+# Half-duplex echo guard (same-laptop mode). The mic can receive the
+# interviewer's audio — acoustically (no headphones) or digitally through a
+# virtual-audio mixer (e.g. SteelSeries Sonar), which headphones don't stop.
+# That audio transcribes as "candidate". While the interviewer is (or was
+# just) audibly speaking, suppress candidate transcription: in this app the
+# candidate answers AFTER the interviewer finishes, so real answers fall
+# outside this window and survive. This value covers the finalization-timing
+# gap between the two independent Deepgram streams (~1s utterance_end).
+INTERVIEWER_ECHO_GUARD_SEC = 1.5
+
 # After we generate an answer, stay quiet for this long unless either
 #   (a) the regex matches a clear new question, or
 #   (b) the user hits the manual hotkey / Regenerate button.
@@ -160,6 +170,9 @@ class App(QObject):
         self._answer_thread: threading.Thread | None = None
         self._answer_cancel = threading.Event()
         self._candidate_speaking_until = 0.0
+        # Wall-clock time until which the interviewer counts as "recently
+        # audible" — candidate audio in this window is suppressed as echo.
+        self._interviewer_voice_until = 0.0
         self._stop = threading.Event()
         self._silence_timer: threading.Timer | None = None
         self._last_answer_started_at = 0.0
@@ -455,14 +468,26 @@ class App(QObject):
             if getattr(self, "_same_laptop_swap", False):
                 speaker = "interviewer" if speaker == "candidate" else "candidate"
 
-        # ── Echo filter (finals only) ────────────────────────────────────
-        # Compare against snapshot() (includes the interviewer's IN-PROGRESS
-        # partial), not snapshot_finalized(). During a long interviewer turn
-        # the mic's acoustic echo of the tail often finalizes before the
-        # interviewer turn commits (the mic + loopback Deepgram streams commit
-        # independently), so the matching interviewer turn isn't finalized yet.
-        # The in-progress partial's ts is recent, so it passes the lag gate.
-        if event.is_final and speaker == "candidate":
+        # Track interviewer voice activity (partials AND finals) for the echo
+        # guard below.
+        if speaker == "interviewer":
+            self._interviewer_voice_until = time.time() + INTERVIEWER_ECHO_GUARD_SEC
+
+        # ── Echo suppression (candidate partials AND finals) ──────────────
+        # Runs on partials too, so interviewer bleed never even flashes on
+        # screen as a candidate turn (the old finals-only filter let partials
+        # display, then dropped the final — the "shows as both then removes"
+        # flicker). Two signals:
+        #   1) Half-duplex guard: while the interviewer is (or was just)
+        #      audibly speaking, any candidate audio is bleed — the candidate
+        #      answers after the question, not over it. Catches short bleed
+        #      fragments the text filter can't (too few words to match).
+        #   2) Text overlap with recent interviewer speech (incl. the
+        #      in-progress partial via snapshot()) — catches echo just outside
+        #      the activity window.
+        if speaker == "candidate":
+            if time.time() <= self._interviewer_voice_until:
+                return
             if is_echo(
                 text, self.transcript.snapshot()[-16:],
                 candidate_ts=event.ts_end,

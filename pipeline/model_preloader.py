@@ -141,7 +141,10 @@ class ModelPreloader:
 
     def run(self, on_status: StatusFn, on_bytes: BytesFn) -> None:
         # 1) STT model (engine-specific). Deepgram needs nothing pre-loaded.
-        engine = (self.cfg.stt_engine or "batch").lower()
+        # Use the EFFECTIVE engine so a keyless "deepgram" default correctly
+        # preloads whisper.cpp (its runtime fallback) instead of skipping it.
+        from pipeline.stt_engines import effective_stt_engine
+        engine = effective_stt_engine(self.cfg)
         if engine == "deepgram":
             on_status("stt", "Using Deepgram cloud — no local model to load.")
         else:

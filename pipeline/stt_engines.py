@@ -151,14 +151,31 @@ class WhisperCppBackend(STTBackend):
 # ── Factory ──────────────────────────────────────────────────────────────────
 
 
-def make_stt_backend(cfg: Config) -> STTBackend:
-    engine = (cfg.stt_engine or "whispercpp").lower()
+def effective_stt_engine(cfg: Config) -> str:
+    """The engine that will ACTUALLY run this session — "deepgram" or "whispercpp".
+
+    Deepgram needs an API key + internet. Without a key we transparently fall
+    back to on-device whisper.cpp, so a fresh (keyless) install still works
+    instead of crashing when DeepgramBackend.__init__ raises. Resolved WITHOUT
+    mutating cfg.stt_engine, so the user's "deepgram" default stays on disk and
+    takes effect the moment they add a key. Use this (not the raw cfg field)
+    anywhere behaviour branches on the engine.
+    """
+    engine = (cfg.stt_engine or "deepgram").lower()
+    if engine == "batch":                       # legacy faster-whisper — removed
+        engine = "whispercpp"
     if engine in ("deepgram", "cloud"):
+        return "deepgram" if cfg.deepgram_api_key else "whispercpp"
+    return "whispercpp"
+
+
+def make_stt_backend(cfg: Config) -> STTBackend:
+    if effective_stt_engine(cfg) == "deepgram":
         from pipeline.deepgram_stt import DeepgramBackend
         return DeepgramBackend(cfg)
     # Auto-migrate any existing "batch" config to whispercpp (faster-whisper
     # was removed in the slim-down; whisper.cpp covers the same use case).
-    if engine == "batch":
+    if (cfg.stt_engine or "").lower() == "batch":
         cfg.stt_engine = "whispercpp"
         cfg.save()
     return WhisperCppBackend(cfg)

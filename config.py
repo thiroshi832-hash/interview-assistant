@@ -46,11 +46,17 @@ class Config:
     openai_deep_model: str = "gpt-4o"        # used by the "deeper answer" hotkey
 
     # ── STT ───────────────────────────────────────────────────────────────────
-    # "whispercpp" = pywhispercpp streaming (partials during speech, CPU-friendly)
-    # "deepgram"   = cloud streaming (lowest latency, requires API key + internet)
-    # (legacy "batch" / faster-whisper was removed in the slim-down — any saved
-    #  config with "batch" is auto-migrated to "whispercpp" at startup.)
-    stt_engine: str = "whispercpp"
+    # "deepgram"   = cloud streaming (lowest latency + server-side diarization,
+    #                which is what makes helper-laptop-acoustic speaker
+    #                attribution work well; requires an API key + internet).
+    # "whispercpp" = pywhispercpp on-device streaming (CPU-friendly, no key, but
+    #                NO speaker tags — helper mode then leans on the weaker local
+    #                voice clustering).
+    # Default is "deepgram"; with no API key it transparently falls back to
+    # whisper.cpp at runtime (see pipeline.stt_engines.effective_stt_engine),
+    # so a keyless install still works. Legacy "batch"/faster-whisper was removed
+    # in the slim-down — any saved "batch" config is migrated to whispercpp.
+    stt_engine: str = "deepgram"
     deepgram_api_key: str = ""
     deepgram_model: str = "nova-3"           # nova-3 is current best for english
     # base.en is ~3x faster than small.en on CPU with only a small accuracy

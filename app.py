@@ -32,7 +32,7 @@ from audio.dual_stream import DualStreamSource
 from audio.network_source import NetworkAudioSource
 from audio.single_mic import SingleMicSource
 from audio.source import AudioSource
-from config import Config
+from config import Config, CONFIG_DIR
 from llm_provider import make_client
 from pipeline.context_summary import ContextSummarizer
 from pipeline.echo_filter import is_echo
@@ -40,7 +40,7 @@ from pipeline.filler import pick_opener
 from pipeline.interview_health import compute_health
 from pipeline.question_detector import QuestionDetector
 from pipeline.stt_backend import STTEvent
-from pipeline.stt_engines import make_stt_backend
+from pipeline.stt_engines import make_stt_backend, effective_stt_engine
 from pipeline.transcript import Transcript
 from pipeline.vad import Segmenter, Utterance
 from paths import icon_path
@@ -117,7 +117,7 @@ class App(QObject):
         # (Previously only `same-laptop + deepgram` got pass-through, which
         # meant helper-laptop + deepgram silently dropped quiet acoustic
         # audio that didn't clear the 0.5 VAD probability threshold.)
-        pass_through = (cfg.stt_engine == "deepgram")
+        pass_through = (effective_stt_engine(cfg) == "deepgram")
         self.segmenter = Segmenter(
             self.source, cfg,
             on_chunk=self._on_speech_chunk,
@@ -178,6 +178,8 @@ class App(QObject):
         # ── threading ─────────────────────────────────────────────────────
         self._answer_thread: threading.Thread | None = None
         self._answer_cancel = threading.Event()
+        # Serializes appends to the Q&A log file (workers may overlap briefly).
+        self._qa_log_lock = threading.Lock()
         self._candidate_speaking_until = 0.0
         # Wall-clock time until which the interviewer counts as "recently
         # audible" — candidate audio in this window is suppressed as echo.
@@ -192,11 +194,11 @@ class App(QObject):
     # ── lifecycle ────────────────────────────────────────────────────────
     def start(self, resume: str, job_title: str, jd: str, personal_context: str = "") -> None:
         self.llm.set_context(resume, job_title, jd, personal_context)
-        if self.cfg.stt_engine == "deepgram":
+        if effective_stt_engine(self.cfg) == "deepgram":
             self.status.emit("Connecting to Deepgram cloud — no local STT model needed.")
         else:
             self.status.emit(
-                f"Loading STT ({self.cfg.stt_engine} / {self.cfg.whisper_model}) — this can take a few seconds…"
+                f"Loading STT ({effective_stt_engine(self.cfg)} / {self.cfg.whisper_model}) — this can take a few seconds…"
             )
 
         # Start the STT backend. If the configured engine fails (e.g. Deepgram
@@ -229,6 +231,19 @@ class App(QObject):
             raise
         self.segmenter.start()
         self.status.emit(f"Listening — mode: {self.mode}")
+
+        # Session separator in the single Q&A log file, so consecutive
+        # interviews are distinguishable.
+        try:
+            with self._qa_log_lock:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                with open(CONFIG_DIR / "qa_log.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"===== session started {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"(mode: {self.mode}) =====\n\n"
+                    )
+        except Exception:
+            pass
 
         # Watchdog — if no audio chunks have arrived 5 seconds in, warn loudly.
         # Catches Windows mic privacy blocks, wrong default device, etc.
@@ -387,15 +402,23 @@ class App(QObject):
         last = getattr(self, "_helper_last_speaker", "interviewer")
         if not event.is_final or not event.pcm:
             return last
+        # Deepgram's single-channel diarization routinely collapses two live,
+        # in-room voices into ONE tag (the "unique_speakers=['0']" debug line),
+        # which forces every turn to the same label. So IGNORE `tag` and do our
+        # OWN voice clustering on the finalized clip, then use the enrolled
+        # candidate anchor to decide which cluster is the candidate: whichever
+        # cluster's running similarity to the anchor is highest is the candidate;
+        # the rest are the interviewer. Embed once and reuse for both.
         try:
-            sim = self.diarizer.anchor_similarity(event.pcm, self.cfg.sample_rate)
+            emb = self.diarizer.embed(event.pcm, self.cfg.sample_rate)
         except Exception:
-            sim = None
-        if sim is None:
+            emb = None
+        if emb is None:
             return last  # too short/quiet to embed — keep last speaker
-        key = tag if tag is not None else "_"
+        key = self.diarizer.assign_from_embedding(emb)
+        sim = float(np.dot(emb, self.diarizer.anchor))
         prev = self._tag_sim.get(key)
-        # EMA per tag: stable, but adapts if a tag's similarity drifts.
+        # EMA per cluster: stable, but adapts if a cluster's similarity drifts.
         self._tag_sim[key] = sim if prev is None else 0.6 * prev + 0.4 * sim
         candidate_key = max(self._tag_sim, key=self._tag_sim.get)
         return "candidate" if key == candidate_key else "interviewer"
@@ -516,7 +539,7 @@ class App(QObject):
 
             # Watchdog: if Deepgram finals keep coming with no speaker tag at
             # all, diarization isn't actually running. Warn the user once.
-            if not anchor_mode and event.is_final and tag is None and self.cfg.stt_engine == "deepgram":
+            if not anchor_mode and event.is_final and tag is None and effective_stt_engine(self.cfg) == "deepgram":
                 self._finals_seen_without_diarize += 1
                 if (self._finals_seen_without_diarize >= 3
                         and not self._diarize_warning_emitted):
@@ -662,18 +685,44 @@ class App(QObject):
         if self._answer_thread and self._answer_thread.is_alive():
             self._answer_cancel.set()
             self._answer_thread.join(timeout=0.5)
-        self._answer_cancel = threading.Event()
+        # Each worker gets its OWN cancel event, passed as an argument. The old
+        # worker is usually blocked inside the LLM network stream for >0.5s, so
+        # the join above times out with it still alive; if it then re-read
+        # self._answer_cancel it would see this NEW (unset) event and keep
+        # streaming — two workers interleaving chunks into the answer box,
+        # producing word-salad. With its own event, the .set() above stops it
+        # at its next chunk no matter when it wakes up.
+        cancel = threading.Event()
+        self._answer_cancel = cancel
         self._last_answer_started_at = time.time()
         self._candidate_spoke_since_answer = False
         self._answer_thread = threading.Thread(
             target=self._answer_worker,
-            args=(deep, style_hint, with_filler),
+            args=(deep, style_hint, with_filler, cancel),
             daemon=True,
         )
         self._answer_thread.start()
 
-    def _answer_worker(self, deep: bool, style_hint: str, with_filler: bool) -> None:
+    def _answer_worker(self, deep: bool, style_hint: str, with_filler: bool,
+                       cancel: threading.Event) -> None:
+        if cancel.is_set():
+            return
+        turns = self.transcript.snapshot()
+
+        # Don't call the LLM when there's genuinely nothing to answer. If turns
+        # exist but NONE are the interviewer's (e.g. speaker attribution has
+        # mislabeled everything as the candidate), the model would be handed a
+        # transcript with no question and reply with a confusing "I haven't
+        # heard anything to answer" — which then sits in the answer box. An
+        # EMPTY transcript is allowed through: that's the intentional manual
+        # "give me a self-intro" case.
+        if turns and not any(t.speaker == "interviewer" for t in turns):
+            self.status.emit("Waiting for an interviewer question…")
+            return
+
         self.clear_answer.emit()
+
+        parts: list[str] = []   # everything shown to the user → Q&A log
 
         # Show an opener immediately so the candidate has something to say
         # while the LLM is still generating. Only on automatic triggers — manual
@@ -683,17 +732,45 @@ class App(QObject):
             opener = pick_opener()
             if opener:
                 self.answer_chunk.emit(opener + "\n\n")
+                parts.append(opener + "\n\n")
 
-        turns = self.transcript.snapshot()
         try:
             for chunk in self.llm.stream_answer(
                 turns, deep=deep, style_hint=style_hint, summary=self._summarizer.summary,
             ):
-                if self._answer_cancel.is_set():
-                    return
+                if cancel.is_set():
+                    break
                 self.answer_chunk.emit(chunk)
+                parts.append(chunk)
         except Exception as e:
-            self.status.emit(f"LLM error: {e}")
+            if not cancel.is_set():
+                self.status.emit(f"LLM error: {e}")
+        finally:
+            question = next(
+                (t.text for t in reversed(turns) if t.speaker == "interviewer"), ""
+            )
+            self._log_qa(question, "".join(parts), cancelled=cancel.is_set())
+
+    def _log_qa(self, question: str, answer: str, *, cancelled: bool) -> None:
+        """
+        Append one Q/A pair to the session-spanning log file
+        (~/.interview_assistant/qa_log.txt). Best-effort — a full disk or
+        locked file must never break the live answer path.
+        """
+        answer = answer.strip()
+        if not answer:
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        q = " ".join(question.split()) or "(manual trigger — no interviewer question)"
+        note = " [cut off — superseded by a newer answer]" if cancelled else ""
+        entry = f"[{stamp}]\nQ: {q}\nA{note}: {answer}\n\n"
+        try:
+            with self._qa_log_lock:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                with open(CONFIG_DIR / "qa_log.txt", "a", encoding="utf-8") as f:
+                    f.write(entry)
+        except Exception:
+            pass
 
 
 def main() -> int:

@@ -121,7 +121,14 @@ class Diarizer:
         emb = self._embed(pcm_int16, sample_rate)
         if emb is None:
             return None
+        return self.assign_from_embedding(emb)
 
+    def assign_from_embedding(self, emb: np.ndarray) -> str:
+        """
+        Cluster an ALREADY-computed unit-norm embedding into a stable cluster ID.
+        Lets a caller that already embedded the clip (e.g. to also compare it to
+        the anchor) avoid paying for a second Resemblyzer pass.
+        """
         with self._lock:
             if not self._centroids:
                 self._centroids.append(emb)

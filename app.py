@@ -77,6 +77,15 @@ INTERVIEWER_ECHO_GUARD_SEC = 1.5
 # Prevents the silence net from firing while the candidate is mid-answer.
 POST_ANSWER_COOLDOWN_SEC = 25.0
 
+# Minimum words in a non-question interviewer turn before it may arm the
+# silence-net trigger. Back-channel acknowledgements while the candidate is
+# answering — "That's", "Got it.", "Right", or STT fragments of a murmur —
+# must NOT schedule an answer: the timer fires with force=True and would
+# replace the answer the candidate is still reading. Real statement-style
+# prompts are longer, and real short questions ("Why?", "Could you share…")
+# still trigger instantly via the '?' / question-opener path.
+MIN_SILENCE_TRIGGER_WORDS = 5
+
 
 class App(QObject):
     """Pipeline controller. Emits Qt signals on the main thread."""
@@ -711,7 +720,7 @@ class App(QObject):
                 not self._candidate_spoke_since_answer
                 and time.time() - self._last_answer_started_at < POST_ANSWER_COOLDOWN_SEC
             )
-            if not in_cooldown:
+            if not in_cooldown and len(text.split()) >= MIN_SILENCE_TRIGGER_WORDS:
                 self._arm_silence_timer(turn)
 
     def _on_transcript_change(self, turn, replaced_partial: bool) -> None:

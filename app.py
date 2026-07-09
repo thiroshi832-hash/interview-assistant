@@ -37,7 +37,6 @@ from config import Config, CONFIG_DIR
 from llm_provider import make_client
 from pipeline.context_summary import ContextSummarizer
 from pipeline.echo_filter import is_echo
-from pipeline.filler import pick_opener
 from pipeline.interview_health import compute_health
 from pipeline.question_detector import QuestionDetector
 from pipeline.stt_backend import STTEvent
@@ -335,8 +334,7 @@ class App(QObject):
 
     # ── manual triggers (from UI buttons / hotkey) ───────────────────────
     def force_answer(self, *, deep: bool = False, style_hint: str = "") -> None:
-        # Manual triggers skip the filler — the user wants a direct answer.
-        self._launch_answer(deep=deep, style_hint=style_hint, with_filler=False)
+        self._launch_answer(deep=deep, style_hint=style_hint)
 
     def swap_speakers(self) -> None:
         """
@@ -709,7 +707,7 @@ class App(QObject):
         if gen == self._answer_current_gen:
             self.answer_chunk.emit(text)
 
-    def _launch_answer(self, *, deep: bool = False, style_hint: str = "", with_filler: bool = True) -> None:
+    def _launch_answer(self, *, deep: bool = False, style_hint: str = "") -> None:
         # cancel anything already running
         if self._answer_thread and self._answer_thread.is_alive():
             self._answer_cancel.set()
@@ -729,12 +727,12 @@ class App(QObject):
         self._candidate_spoke_since_answer = False
         self._answer_thread = threading.Thread(
             target=self._answer_worker,
-            args=(gen, deep, style_hint, with_filler, cancel),
+            args=(gen, deep, style_hint, cancel),
             daemon=True,
         )
         self._answer_thread.start()
 
-    def _answer_worker(self, gen: int, deep: bool, style_hint: str, with_filler: bool,
+    def _answer_worker(self, gen: int, deep: bool, style_hint: str,
                        cancel: threading.Event) -> None:
         if cancel.is_set():
             return
@@ -754,16 +752,6 @@ class App(QObject):
         self._answer_evt.emit(gen, True, "")
 
         parts: list[str] = []   # everything shown to the user → Q&A log
-
-        # Show an opener immediately so the candidate has something to say
-        # while the LLM is still generating. Only on automatic triggers — manual
-        # Regenerate / Shorter / Deeper should respond directly.
-        # pick_opener() may return "" — clean start, no filler this turn.
-        if with_filler:
-            opener = pick_opener()
-            if opener:
-                self._answer_evt.emit(gen, False, opener + "\n\n")
-                parts.append(opener + "\n\n")
 
         try:
             for chunk in self.llm.stream_answer(

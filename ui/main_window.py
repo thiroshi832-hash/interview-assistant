@@ -1,6 +1,7 @@
 """Main window: holds the setup view, then swaps to the interview view."""
 from __future__ import annotations
 
+from PySide6.QtCore import QByteArray
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QMainWindow, QStackedWidget
 
@@ -65,8 +66,16 @@ class MainWindow(QMainWindow):
 
     # ── window geometry persistence ──────────────────────────────────────────
     def _restore_geometry(self) -> None:
-        """Restore the saved size, clamped to the current screen so the window
-        (and its bottom resize grip) always fits — then center it."""
+        """Restore the full saved geometry (position + size + maximized state +
+        pre-maximize normal geometry). Falls back to a screen-clamped, centered
+        default on first launch or if the saved blob is invalid/stale."""
+        blob = self.cfg.window_geometry
+        if blob:
+            try:
+                if self.restoreGeometry(QByteArray.fromBase64(blob.encode("ascii"))):
+                    return
+            except Exception:
+                pass
         w = int(self.cfg.window_width or 1280)
         h = int(self.cfg.window_height or 760)
         screen = QGuiApplication.primaryScreen()
@@ -81,9 +90,19 @@ class MainWindow(QMainWindow):
             self.move(fg.topLeft())
 
     def closeEvent(self, event) -> None:
-        # Persist the height/width the user settled on for next launch.
-        self.cfg.window_width = self.width()
-        self.cfg.window_height = self.height()
+        # Persist the full geometry for next launch. saveGeometry() encodes the
+        # NORMAL geometry separately from the maximized flag, so closing while
+        # maximized doesn't overwrite the original size/position.
+        try:
+            self.cfg.window_geometry = bytes(
+                self.saveGeometry().toBase64()
+            ).decode("ascii")
+        except Exception:
+            self.cfg.window_geometry = ""
+        # Keep the legacy fallback fields on the UN-maximized size.
+        g = self.normalGeometry() if self.isMaximized() else self.geometry()
+        self.cfg.window_width = g.width()
+        self.cfg.window_height = g.height()
         try:
             self.cfg.save()
         except Exception:

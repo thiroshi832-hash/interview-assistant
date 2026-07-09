@@ -124,9 +124,15 @@ class Config:
     answer_font_size: int = 16               # pixels; the A− / A+ buttons persist here
     transcript_collapsed: bool = False
     # Persisted main-window size. Restored (clamped to the screen) on launch and
-    # saved on close, so the height you set sticks between sessions.
+    # saved on close, so the height you set sticks between sessions. Kept as a
+    # fallback for first launch / when window_geometry is missing or invalid.
     window_width: int = 1280
     window_height: int = 760
+    # Full Qt geometry blob (QWidget.saveGeometry, base64). Unlike width/height
+    # it also preserves the window POSITION, the maximized state, and the
+    # pre-maximize "normal" geometry — so closing while maximized restores a
+    # maximized window whose un-maximize returns to the original size/place.
+    window_geometry: str = ""
 
     # ── Interview metadata (filled in by the UI before "Start") ───────────────
     # Persisted so the setup screen restores the last session's resume/role

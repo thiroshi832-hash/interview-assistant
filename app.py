@@ -86,6 +86,17 @@ POST_ANSWER_COOLDOWN_SEC = 25.0
 # still trigger instantly via the '?' / question-opener path.
 MIN_SILENCE_TRIGGER_WORDS = 5
 
+# Bleed loud enough to beat the mic RMS gate arrives GARBLED — its word
+# overlap with the interviewer's own transcription often lands just under the
+# normal echo threshold ("overhead and query" heard as "or the heavy"). So
+# when candidate audio temporally overlaps ACTIVE interviewer audio on the
+# other channel, raise the bar: candidate speech must be substantial AND pass
+# a looser fuzzy-echo check. Genuine mid-question barge-ins are rare; the
+# candidate's real answer starts after the interviewer stops.
+OVERLAP_MIN_WORDS = 8            # min words for candidate speech during overlap
+OVERLAP_ECHO_THRESHOLD = 0.40    # looser is_echo threshold during overlap
+CHANNEL_ACTIVE_RMS = 250.0       # chunk RMS above this = channel audibly active
+
 
 class App(QObject):
     """Pipeline controller. Emits Qt signals on the main thread."""
@@ -407,6 +418,20 @@ class App(QObject):
             vals = [r for (t, r) in samples if t >= cutoff]
         return max(vals) if vals else 0.0
 
+    def _channel_active(self, speaker: str, ts_start: float, ts_end: float) -> bool:
+        """
+        True if this channel carried audible speech within the window. Level
+        matters, not mere chunk presence: in Deepgram pass-through mode every
+        chunk (including silence) flows through _on_speech_chunk.
+        """
+        dq = self._chunk_rms.get(speaker)
+        if not dq:
+            return False
+        return any(
+            ts_start - 0.3 <= t <= ts_end + 0.3 and r >= CHANNEL_ACTIVE_RMS
+            for (t, r) in list(dq)
+        )
+
     def _retract_candidate_partial(self) -> None:
         """
         Erase the candidate's in-progress transcript line after its utterance
@@ -680,6 +705,17 @@ class App(QObject):
             if len(text.split()) < 5 and time.time() <= self._interviewer_voice_until:
                 self._retract_candidate_partial()
                 return
+            # Candidate audio that temporally OVERLAPS audible interviewer
+            # audio is almost always their voice bleeding into the mic — and
+            # loud bleed transcribes garbled, sliding under the normal echo
+            # threshold above. Demand length + pass a looser fuzzy-echo check.
+            if self._channel_active("interviewer", event.ts_start, event.ts_end):
+                if len(text.split()) < OVERLAP_MIN_WORDS or is_echo(
+                    text, recent, candidate_ts=event.ts_end,
+                    overlap_threshold=OVERLAP_ECHO_THRESHOLD,
+                ):
+                    self._retract_candidate_partial()
+                    return
 
         # ── Update transcript (partial or final) ─────────────────────────
         if event.is_final:

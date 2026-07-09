@@ -14,6 +14,32 @@ _MAX_FONT = 32
 _DEFAULT_FONT = 16
 
 
+class _AnswerEdit(QTextEdit):
+    """
+    QTextEdit with gentler mouse-wheel scrolling. Qt's default is 3 text lines
+    per wheel notch, and a "line" grows with the answer font — at 24-32px the
+    view leaps ~70-115px per notch, which reads as jumpy/too fast. Scroll
+    exactly ONE line per notch instead, and use the OS-provided pixel deltas
+    directly for touchpads (smooth by nature).
+    """
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Preserve Ctrl+wheel (font zoom on read-only QTextEdit).
+            super().wheelEvent(event)
+            return
+        sb = self.verticalScrollBar()
+        pixels = event.pixelDelta().y()
+        if not pixels:
+            notches = event.angleDelta().y() / 120.0
+            pixels = int(notches * self.fontMetrics().lineSpacing())
+        if pixels:
+            sb.setValue(sb.value() - pixels)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+
 class InterviewView(QWidget):
     answer_now = Signal()
     style_request = Signal(str)
@@ -121,11 +147,16 @@ class InterviewView(QWidget):
         right.addLayout(font_row)
 
         # answer text
-        self.answer = QTextEdit()
+        self.answer = _AnswerEdit()
         self.answer.setReadOnly(True)
         self.answer.setObjectName("answer")
         right.addWidget(self.answer, stretch=1)
         self._apply_answer_font()
+        # True while the most recently inserted answer char is a newline —
+        # lets append_answer_chunk collapse "\n\n" paragraph gaps across
+        # chunk boundaries (LLMs stream blank lines between paragraphs, which
+        # doubles the apparent line spacing).
+        self._answer_at_line_start = True
 
         # action buttons
         btn_row = QHBoxLayout()
@@ -197,6 +228,7 @@ class InterviewView(QWidget):
     @Slot()
     def clear_answer(self):
         self.answer.clear()
+        self._answer_at_line_start = True
         # New answer just started → reset the scroll to the very top so the
         # user always reads the beginning first, regardless of how long the
         # previous answer was.
@@ -205,6 +237,23 @@ class InterviewView(QWidget):
 
     @Slot(str)
     def append_answer_chunk(self, text: str):
+        # Collapse runs of newlines to a single newline (state carries across
+        # chunk boundaries). LLM answers separate paragraphs with "\n\n"; the
+        # resulting blank line doubles the visual line spacing and makes the
+        # short answers look sparse. Leading newlines at the top are dropped.
+        chars = []
+        for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
+            if ch == "\n":
+                if not self._answer_at_line_start:
+                    chars.append(ch)
+                    self._answer_at_line_start = True
+            else:
+                chars.append(ch)
+                self._answer_at_line_start = False
+        text = "".join(chars)
+        if not text:
+            return
+
         # Insert at the end of the document WITHOUT touching the visible
         # viewport. We deliberately don't call `setTextCursor(cur)` here —
         # that would force Qt to scroll the view so the cursor is visible
@@ -278,8 +327,10 @@ class InterviewView(QWidget):
         self.set_font_size(self.font_size + delta)
 
     def _apply_answer_font(self) -> None:
+        # (No line-height here — Qt stylesheets don't support it; it was
+        # silently ignored. Line spacing is the font's natural spacing.)
         self.answer.setStyleSheet(
-            f"QTextEdit#answer {{ font-size: {self.font_size}px; line-height: 1.6; }}"
+            f"QTextEdit#answer {{ font-size: {self.font_size}px; }}"
         )
         self.font_size_label.setText(f"{self.font_size}px")
 

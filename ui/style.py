@@ -39,7 +39,7 @@ QPushButton#danger:hover { background: #fab387; }
 QRadioButton { color: #cdd6f4; padding: 6px; }
 QLabel { color: #cdd6f4; }
 QLabel#hint { color: #a6adc8; font-size: 11px; }
-QLabel#answer { font-size: 16px; line-height: 1.6; }
+QLabel#answer { font-size: 16px; }
 
 QScrollBar:vertical { background: #1e1e2e; width: 10px; }
 QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; min-height: 20px; }

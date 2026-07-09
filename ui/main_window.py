@@ -18,9 +18,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AetherStack Interview Assistant")
         self.setStyleSheet(STYLE)
         # Let the window shrink well below the content's natural size so it can
-        # be made short on small laptop screens (content scrolls / clips rather
-        # than pinning a tall minimum the user can't drag past).
-        self.setMinimumSize(640, 200)
+        # be made short AND narrow (e.g. a slim strip beside the interview
+        # window). The explicit minimum overrides the layout's own minimum
+        # (~1113x925 from the button row / panels); content clips or scrolls
+        # rather than pinning a size the user can't drag past.
+        self.setMinimumSize(320, 200)
         self._restore_geometry()
 
         self.stack = QStackedWidget()
@@ -72,7 +74,7 @@ class MainWindow(QMainWindow):
             avail = screen.availableGeometry()
             w = min(w, avail.width())
             h = min(h, avail.height())
-        self.resize(max(w, 640), max(h, 200))
+        self.resize(max(w, 320), max(h, 200))
         if screen is not None:
             fg = self.frameGeometry()
             fg.moveCenter(avail.center())

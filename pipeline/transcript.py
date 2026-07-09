@@ -113,6 +113,26 @@ class Transcript:
                 pass
         return turn
 
+    def retract_partial(self, speaker: str) -> bool:
+        """
+        Drop this speaker's in-progress turn outright (utterance judged to be
+        bleed/echo after its partial was already shown). Unlike update/commit,
+        this removes the pending turn WHEREVER it sits — in the common bleed
+        race the interviewer's own final lands after the bleed partial, so the
+        partial is no longer the tail, yet it must still be erased. Returns
+        True if a pending turn was removed (caller should then tell the UI to
+        erase the displayed line).
+        """
+        with self._lock:
+            pending = self._pending.pop(speaker, None)
+            if pending is None:
+                return False
+            for i in range(len(self._turns) - 1, -1, -1):
+                if self._turns[i] is pending:
+                    del self._turns[i]
+                    return True
+        return False
+
     # ── reads ──────────────────────────────────────────────────────────────
     def snapshot(self) -> list[Turn]:
         """All turns including partials."""

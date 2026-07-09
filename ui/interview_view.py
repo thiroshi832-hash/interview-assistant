@@ -200,7 +200,21 @@ class InterviewView(QWidget):
         - replaces_pending=True : replace the speaker's most-recent in-progress
           line in place (partial → newer partial, or partial → final).
         - replaces_pending=False: append a brand-new line.
+        - replaces_pending=True with EMPTY text: retract — delete the speaker's
+          pending line (its utterance was judged interviewer bleed after the
+          partial was already displayed).
         """
+        if replaces_pending and not text.strip():
+            idx = self._pending_idx.pop(speaker, None)
+            if idx is not None and 0 <= idx < len(self._transcript_lines):
+                del self._transcript_lines[idx]
+                # Reindex the other speakers' pending lines after the removal.
+                for k, v in self._pending_idx.items():
+                    if v > idx:
+                        self._pending_idx[k] = v - 1
+                self._rerender_transcript()
+            return
+
         if replaces_pending and speaker in self._pending_idx:
             idx = self._pending_idx[speaker]
             if 0 <= idx < len(self._transcript_lines):

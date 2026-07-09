@@ -11,6 +11,7 @@ import itertools
 import sys
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 # ── PyInstaller "windowed" mode (--noconsole) sets sys.stdout/stderr to None.
@@ -185,6 +186,8 @@ class App(QObject):
         self._answer_cancel = threading.Event()
         # Serializes appends to the Q&A log file (workers may overlap briefly).
         self._qa_log_lock = threading.Lock()
+        # Per-channel rolling chunk loudness — see _on_speech_chunk.
+        self._chunk_rms: dict[str, deque] = {}
         # Monotonic answer generation. next() on itertools.count is atomic in
         # CPython, so concurrent triggers can't mint duplicate generations.
         self._answer_gen_counter = itertools.count(1)
@@ -366,7 +369,46 @@ class App(QObject):
     # ── audio → text path ────────────────────────────────────────────────
     def _on_speech_chunk(self, speaker: Optional[str], pcm: bytes, ts: float) -> None:
         """Segmenter callback — fired for every PCM chunk during active speech."""
+        # Rolling per-channel loudness (~30 ms RMS per chunk, last ~8 s). Lets
+        # the bleed gate judge PARTIALS, which carry no PCM of their own.
+        if speaker is not None:
+            try:
+                arr = np.frombuffer(pcm, dtype=np.int16)
+                if arr.size:
+                    rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+                    self._chunk_rms.setdefault(speaker, deque(maxlen=256)).append((ts, rms))
+            except Exception:
+                pass
         self.stt.feed(pcm, speaker, ts)
+
+    def _recent_channel_peak(self, speaker: str, ts_start: float, ts_end: float) -> float:
+        """
+        Loudest ~30 ms chunk RMS on this channel within [ts_start, ts_end]
+        (falling back to the last 2 s of the channel if the window is empty —
+        STT timestamps and chunk timestamps come from different clocks in some
+        backends). 0.0 if the channel has no recorded audio yet.
+        """
+        dq = self._chunk_rms.get(speaker)
+        if not dq:
+            return 0.0
+        samples = list(dq)
+        vals = [r for (t, r) in samples if ts_start - 0.2 <= t <= ts_end + 0.2]
+        if not vals:
+            cutoff = samples[-1][0] - 2.0
+            vals = [r for (t, r) in samples if t >= cutoff]
+        return max(vals) if vals else 0.0
+
+    def _retract_candidate_partial(self) -> None:
+        """
+        Erase the candidate's in-progress transcript line after its utterance
+        was judged interviewer bleed. Without this, a bleed partial that was
+        displayed before the interviewer's own text arrived (the two STT
+        connections race at every sentence start) stays behind as an orphan
+        italic [CANDIDATE] line.
+        """
+        if self.transcript.retract_partial("candidate"):
+            # Empty text + replaces_pending=True → the UI deletes the line.
+            self.turn_update.emit("candidate", "", True, True)
 
     def _on_speech_close(self, speaker: Optional[str], ts: float) -> None:
         """Segmenter callback — VAD detected end-of-speech for this speaker."""
@@ -606,12 +648,28 @@ class App(QObject):
         if speaker == "candidate" and event.speaker is not None:
             if event.is_final and event.pcm:
                 if self._clip_peak_rms(event.pcm, self.cfg.sample_rate) < self.cfg.mic_gate_rms:
-                    return  # peak too faint to be the candidate → interviewer bleed
+                    # Peak too faint to be the candidate → interviewer bleed.
+                    # Also erase any partial of it already on screen.
+                    self._retract_candidate_partial()
+                    return
+            if not event.is_final:
+                # PARTIALS carry no PCM, so gate them on the channel's rolling
+                # chunk loudness instead. This is the only guard that can catch
+                # bleed at the START of an interviewer sentence: the text-based
+                # filters below need the interviewer's own transcription, which
+                # races ours through a separate STT connection and usually
+                # hasn't arrived yet.
+                peak = self._recent_channel_peak("candidate", event.ts_start, event.ts_end)
+                if peak and peak < self.cfg.mic_gate_rms:
+                    self._retract_candidate_partial()
+                    return
             # Backup text-overlap echo filter (catches any louder echo).
             recent = self.transcript.snapshot()[-16:]
             if is_echo(text, recent, candidate_ts=event.ts_end):
+                self._retract_candidate_partial()
                 return
             if len(text.split()) < 5 and time.time() <= self._interviewer_voice_until:
+                self._retract_candidate_partial()
                 return
 
         # ── Update transcript (partial or final) ─────────────────────────

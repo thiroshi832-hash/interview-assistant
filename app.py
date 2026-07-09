@@ -7,6 +7,7 @@ question detector → Claude → UI.
 from __future__ import annotations
 
 import io
+import itertools
 import sys
 import threading
 import time
@@ -84,6 +85,11 @@ class App(QObject):
     turn_update = Signal(str, str, bool, bool)  # speaker, text, is_final, replaces_pending
     clear_answer = Signal()
     answer_chunk = Signal(str)
+    # Internal: (generation, is_clear, text) from answer workers. Funnelled
+    # through a main-thread slot that drops chunks from superseded generations
+    # before re-emitting clear_answer / answer_chunk to the UI — see
+    # _on_answer_evt for why the filtering must happen on the receiving thread.
+    _answer_evt = Signal(int, bool, str)
     status = Signal(str)
     health_update = Signal(int, str, str)   # score, label, note
     mic_level = Signal(int)                  # 0..100 mic input level
@@ -180,6 +186,11 @@ class App(QObject):
         self._answer_cancel = threading.Event()
         # Serializes appends to the Q&A log file (workers may overlap briefly).
         self._qa_log_lock = threading.Lock()
+        # Monotonic answer generation. next() on itertools.count is atomic in
+        # CPython, so concurrent triggers can't mint duplicate generations.
+        self._answer_gen_counter = itertools.count(1)
+        self._answer_current_gen = 0   # touched ONLY in _on_answer_evt (main thread)
+        self._answer_evt.connect(self._on_answer_evt)
         self._candidate_speaking_until = 0.0
         # Wall-clock time until which the interviewer counts as "recently
         # audible" — candidate audio in this window is suppressed as echo.
@@ -680,6 +691,24 @@ class App(QObject):
             self._summarizing = False
 
     # ── Claude streaming ─────────────────────────────────────────────────
+    def _on_answer_evt(self, gen: int, is_clear: bool, text: str) -> None:
+        """
+        Main-thread gatekeeper between answer workers and the UI. A cancelled
+        worker can still have ONE chunk in flight (it passed its cancel check
+        and was preempted before emitting), so emitter-side checks alone can't
+        fully prevent a stale fragment landing in a newer answer. All deliveries
+        serialize here on the main thread, where generation comparison is
+        race-free: a clear from a newer generation advances the bar, and any
+        chunk whose generation is below it is dropped.
+        """
+        if is_clear:
+            if gen >= self._answer_current_gen:
+                self._answer_current_gen = gen
+                self.clear_answer.emit()
+            return
+        if gen == self._answer_current_gen:
+            self.answer_chunk.emit(text)
+
     def _launch_answer(self, *, deep: bool = False, style_hint: str = "", with_filler: bool = True) -> None:
         # cancel anything already running
         if self._answer_thread and self._answer_thread.is_alive():
@@ -691,19 +720,21 @@ class App(QObject):
         # self._answer_cancel it would see this NEW (unset) event and keep
         # streaming — two workers interleaving chunks into the answer box,
         # producing word-salad. With its own event, the .set() above stops it
-        # at its next chunk no matter when it wakes up.
+        # at its next chunk no matter when it wakes up. The generation filter
+        # in _on_answer_evt catches the one chunk that can still be in flight.
         cancel = threading.Event()
         self._answer_cancel = cancel
+        gen = next(self._answer_gen_counter)
         self._last_answer_started_at = time.time()
         self._candidate_spoke_since_answer = False
         self._answer_thread = threading.Thread(
             target=self._answer_worker,
-            args=(deep, style_hint, with_filler, cancel),
+            args=(gen, deep, style_hint, with_filler, cancel),
             daemon=True,
         )
         self._answer_thread.start()
 
-    def _answer_worker(self, deep: bool, style_hint: str, with_filler: bool,
+    def _answer_worker(self, gen: int, deep: bool, style_hint: str, with_filler: bool,
                        cancel: threading.Event) -> None:
         if cancel.is_set():
             return
@@ -720,7 +751,7 @@ class App(QObject):
             self.status.emit("Waiting for an interviewer question…")
             return
 
-        self.clear_answer.emit()
+        self._answer_evt.emit(gen, True, "")
 
         parts: list[str] = []   # everything shown to the user → Q&A log
 
@@ -731,7 +762,7 @@ class App(QObject):
         if with_filler:
             opener = pick_opener()
             if opener:
-                self.answer_chunk.emit(opener + "\n\n")
+                self._answer_evt.emit(gen, False, opener + "\n\n")
                 parts.append(opener + "\n\n")
 
         try:
@@ -740,7 +771,7 @@ class App(QObject):
             ):
                 if cancel.is_set():
                     break
-                self.answer_chunk.emit(chunk)
+                self._answer_evt.emit(gen, False, chunk)
                 parts.append(chunk)
         except Exception as e:
             if not cancel.is_set():

@@ -24,7 +24,7 @@ if sys.stderr is None:
     sys.stderr = io.StringIO()
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QSharedMemory, Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -904,6 +904,24 @@ def main() -> int:
         qt_app.setWindowIcon(QIcon(icon_path("png")))
     except Exception:
         pass
+
+    # Single-instance guard (same pattern as the sender). A second assistant
+    # would fight the first for the mic / loopback devices and run a duplicate
+    # STT + LLM session. Held in a module global for the process lifetime so
+    # it isn't garbage-collected; Windows frees the shared-memory segment
+    # automatically when the process dies, even on a crash.
+    global _instance_lock
+    _instance_lock = QSharedMemory("AetherStackAssistant-singleton")
+    if not _instance_lock.create(1):
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("AetherStack Interview Assistant")
+        box.setText(
+            "AetherStack Interview Assistant is already running.\n\n"
+            "Check the taskbar for the existing window."
+        )
+        box.exec()
+        return 0
 
     # ── Trial / license gate ───────────────────────────────────────────────
     # Stamp the first run so the 30-day countdown can start.

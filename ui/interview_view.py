@@ -239,6 +239,15 @@ class InterviewView(QWidget):
     def append_turn(self, speaker: str, text: str):
         self.update_turn(speaker, text, True, False)
 
+    def reset(self) -> None:
+        """Wipe transcript + answer for a fresh interview (the view persists
+        across interviews, so a new session must not inherit old lines)."""
+        self._transcript_lines.clear()
+        self._pending_idx.clear()
+        self.answer.clear()
+        self._answer_at_line_start = True
+        self._rerender_transcript()
+
     @Slot()
     def clear_answer(self):
         self.answer.clear()

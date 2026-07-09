@@ -987,6 +987,42 @@ def main() -> int:
 
     controller: App | None = None
 
+    # Wire the interview-view buttons ONCE. The interview view persists across
+    # interviews, so wiring these inside on_ready would stack a duplicate
+    # handler on every new interview (double answers, etc.). The lambdas read
+    # whichever `controller` is current, and no-op when there isn't one.
+    win.interview_view.answer_now.connect(lambda: controller and controller.force_answer())
+    win.interview_view.style_request.connect(lambda hint: controller and controller.force_answer(style_hint=hint))
+    win.interview_view.deep_request.connect(lambda: controller and controller.force_answer(deep=True))
+    win.interview_view.swap_speakers.connect(lambda: controller and controller.swap_speakers())
+    win.interview_view.stop_request.connect(lambda: controller and controller.stop())
+
+    def end_with_eval():
+        nonlocal controller
+        if controller is None:
+            return
+        # Pause audio capture immediately so no new audio piles up while the
+        # LLM evaluates.
+        try:
+            controller.segmenter.stop()
+            controller.source.stop()
+        except Exception:
+            pass
+        # Modal evaluation dialog; its worker thread calls the LLM with the
+        # snapshotted transcript.
+        ev_dlg = EvaluationDialog(
+            evaluator=lambda: controller.llm.evaluate_interview(
+                controller.transcript.snapshot_finalized()
+            )
+        )
+        ev_dlg.exec()
+        # Dialog closed → tear down the pipeline and return to the setup
+        # screen so the user can review settings or start another interview.
+        controller.stop()
+        controller = None
+        win.show_setup()
+    win.interview_view.end_interview_request.connect(end_with_eval)
+
     def on_ready(resume: str, title: str, jd: str, personal_context: str = ""):
         nonlocal controller
         try:
@@ -995,6 +1031,9 @@ def main() -> int:
             QMessageBox.critical(win, "Could not start", str(e))
             return
 
+        # Fresh slate — clear any transcript/answer from a previous interview.
+        win.interview_view.reset()
+
         # Wire signals → UI
         controller.turn_update.connect(win.interview_view.update_turn, Qt.ConnectionType.QueuedConnection)
         controller.clear_answer.connect(win.interview_view.clear_answer, Qt.ConnectionType.QueuedConnection)
@@ -1002,35 +1041,6 @@ def main() -> int:
         controller.status.connect(win.interview_view.set_status, Qt.ConnectionType.QueuedConnection)
         controller.health_update.connect(win.interview_view.set_health, Qt.ConnectionType.QueuedConnection)
         controller.mic_level.connect(win.interview_view.set_mic_level, Qt.ConnectionType.QueuedConnection)
-
-        # Wire UI buttons → controller
-        win.interview_view.answer_now.connect(lambda: controller and controller.force_answer())
-        win.interview_view.style_request.connect(lambda hint: controller and controller.force_answer(style_hint=hint))
-        win.interview_view.deep_request.connect(lambda: controller and controller.force_answer(deep=True))
-        win.interview_view.swap_speakers.connect(lambda: controller and controller.swap_speakers())
-        win.interview_view.stop_request.connect(lambda: controller and controller.stop())
-
-        def end_with_eval():
-            if controller is None:
-                return
-            # Pause audio capture immediately so no new audio piles up while
-            # the LLM evaluates.
-            try:
-                controller.segmenter.stop()
-                controller.source.stop()
-            except Exception:
-                pass
-            # Open the modal evaluation dialog; the worker thread inside it
-            # calls the LLM with the snapshotted transcript.
-            ev_dlg = EvaluationDialog(
-                evaluator=lambda: controller.llm.evaluate_interview(
-                    controller.transcript.snapshot_finalized()
-                )
-            )
-            ev_dlg.exec()
-            # User closed the dialog → tear down the rest of the pipeline.
-            controller.stop()
-        win.interview_view.end_interview_request.connect(end_with_eval)
 
         # Inject the LLM context BEFORE preloading so the preloader's warmup
         # step caches the right prefix (resume + role + personal_context).

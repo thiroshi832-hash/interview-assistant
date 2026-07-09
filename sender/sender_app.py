@@ -7,10 +7,13 @@ mic + the system-audio loopback and streams both to the helper laptop
 (running AetherStack Interview Assistant in helper-network mode) over a
 single WebSocket.
 
+Streaming starts AUTOMATICALLY on launch (with the saved devices/port) — the
+tray menu is only needed to pause, change settings, or quit.
+
 Tray menu:
     ▸ Status line (port + client count)
-    ▸ Start / Stop streaming
-    ▸ Settings...              (only dialog; opens on demand)
+    ▸ Stop / Start streaming   (pause without quitting)
+    ▸ Settings...              (only dialog; opens on demand, streaming resumes on Save)
     ▸ Show local IP addresses
     ▸ Quit
 
@@ -29,7 +32,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = io.StringIO()
 
-from PySide6.QtCore import Qt, Signal, QObject, QSharedMemory
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSharedMemory
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
@@ -101,8 +104,8 @@ class SettingsDialog(QDialog):
 
         hint = QLabel(
             "Pick the devices to stream and the port to listen on. The window\n"
-            "will close after you click Save — the sender keeps running in the\n"
-            "system tray."
+            "will close after you click Save and streaming resumes automatically\n"
+            "with the new settings."
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
@@ -257,12 +260,22 @@ class SenderTrayApp(QObject):
         # like it never started.
         self.tray.showMessage(
             "AetherStack Sender is running",
-            "It lives in the system tray. On Windows 11 click the ^ "
-            "\"show hidden icons\" arrow near the clock to find it, then "
-            "right-click for Start / Settings / Quit.",
+            "Streaming starts automatically. The icon lives in the system "
+            "tray — on Windows 11 click the ^ \"show hidden icons\" arrow "
+            "near the clock, then right-click for Stop / Settings / Quit.",
             QSystemTrayIcon.MessageIcon.Information,
             6000,
         )
+
+        # Auto-start streaming: launching this app has exactly one purpose, so
+        # don't make the user hunt down a hidden tray icon to click Start.
+        # Deferred one tick so the tray icon and hello bubble render before
+        # start() briefly blocks on the WebSocket server coming up.
+        QTimer.singleShot(200, self._autostart)
+
+    def _autostart(self) -> None:
+        if not self._running:
+            self._start()
 
     # ── Tray interactions ────────────────────────────────────────────────
     def _on_tray_activated(self, reason) -> None:
@@ -322,6 +335,9 @@ class SenderTrayApp(QObject):
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_cfg:
             self.cfg = dlg.result_cfg
             _save_sender_cfg(self.cfg)
+            # Auto-stream philosophy: resume immediately with the new
+            # devices/port instead of waiting for a manual Start.
+            self._start()
 
     def _show_ip(self) -> None:
         ips = SenderStreamer.local_ips()

@@ -325,10 +325,11 @@ class App(QObject):
             if time.time() < self._candidate_speaking_until:
                 self._arm_silence_timer(turn)
                 return
-            # 2) Don't fire while ANYONE is mid-utterance (the candidate may
-            #    be speaking right now but no Utterance has been emitted yet
-            #    because their VAD segment hasn't closed).
-            if self.segmenter.is_anyone_speaking():
+            # 2) Don't fire while ANYONE is mid-utterance (the candidate may be
+            #    speaking right now but no Utterance/final has been emitted yet).
+            #    is_anyone_speaking() only works with local VAD; _recently_audible
+            #    covers Deepgram pass-through (the default), where it stays False.
+            if self.segmenter.is_anyone_speaking() or self._recently_audible():
                 self._arm_silence_timer(turn)
                 return
             # 3) Cooldown: if we just generated an answer and the candidate
@@ -389,16 +390,19 @@ class App(QObject):
     # ── audio → text path ────────────────────────────────────────────────
     def _on_speech_chunk(self, speaker: Optional[str], pcm: bytes, ts: float) -> None:
         """Segmenter callback — fired for every PCM chunk during active speech."""
-        # Rolling per-channel loudness (~30 ms RMS per chunk, last ~8 s). Lets
-        # the bleed gate judge PARTIALS, which carry no PCM of their own.
-        if speaker is not None:
-            try:
-                arr = np.frombuffer(pcm, dtype=np.int16)
-                if arr.size:
-                    rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                    self._chunk_rms.setdefault(speaker, deque(maxlen=256)).append((ts, rms))
-            except Exception:
-                pass
+        # Rolling per-channel loudness (~30 ms RMS per chunk, last ~8 s). Feeds
+        # the partial bleed gate (which has no PCM of its own) and the
+        # "is anyone speaking right now" check the silence-net trigger uses.
+        # Single-mic (helper) chunks have speaker=None → bucket them under
+        # "_mic" so that check still has a signal there.
+        try:
+            arr = np.frombuffer(pcm, dtype=np.int16)
+            if arr.size:
+                rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+                key = speaker if speaker is not None else "_mic"
+                self._chunk_rms.setdefault(key, deque(maxlen=256)).append((ts, rms))
+        except Exception:
+            pass
         self.stt.feed(pcm, speaker, ts)
 
     def _recent_channel_peak(self, speaker: str, ts_start: float, ts_end: float) -> float:
@@ -417,6 +421,26 @@ class App(QObject):
             cutoff = samples[-1][0] - 2.0
             vals = [r for (t, r) in samples if t >= cutoff]
         return max(vals) if vals else 0.0
+
+    def _recently_audible(self, within_sec: float = 0.4) -> bool:
+        """
+        True if ANY channel carried speech-level audio in the last `within_sec`
+        seconds. This is the cross-engine "is someone talking right now" check:
+        the VAD segmenter's is_anyone_speaking() only works in local-VAD mode
+        and stays False in Deepgram pass-through (the default), so the
+        silence-net trigger needs this to avoid answering over a live speaker.
+        """
+        now = time.time()
+        for dq in list(self._chunk_rms.values()):
+            try:
+                for ts, rms in reversed(list(dq)):
+                    if now - ts > within_sec:
+                        break
+                    if rms >= CHANNEL_ACTIVE_RMS:
+                        return True
+            except Exception:
+                continue
+        return False
 
     def _channel_active(self, speaker: str, ts_start: float, ts_end: float) -> bool:
         """
@@ -508,6 +532,24 @@ class App(QObject):
         candidate_key = max(self._tag_sim, key=self._tag_sim.get)
         return "candidate" if key == candidate_key else "interviewer"
 
+    def _resolve_by_cluster(self, event: STTEvent, text: str) -> Optional[str]:
+        """
+        No-enrollment single-mic labeling: cluster the finalized clip locally
+        (ignoring Deepgram's unreliable single-channel tag) and label the
+        cluster behaviourally via the AutoLabeler (question-rate / length /
+        first-to-speak). Returns None for partials or clips too short to embed
+        so the caller keeps the last known speaker.
+        """
+        if not event.is_final or not event.pcm:
+            return None
+        try:
+            cluster = self.diarizer.assign(event.pcm, self.cfg.sample_rate)
+        except Exception:
+            cluster = None
+        if not cluster:
+            return None
+        return self.auto_labeler.observe(cluster, text, event.ts_end)
+
     def _on_stt_event(self, event: STTEvent) -> None:
         """
         STT backend callback. Fires from the backend's worker thread for
@@ -533,127 +575,28 @@ class App(QObject):
             if getattr(self, "_same_laptop_swap", False):
                 speaker = "interviewer" if speaker == "candidate" else "candidate"
         else:
-            # Helper-laptop mode — single mic stream. Two paths to a label:
-            #
-            #   Preferred: Deepgram's server-side diarization tags each word
-            #   with a stable speaker ID. We map those tags to candidate /
-            #   interviewer ONCE per session (via the anchor embedding on the
-            #   first sufficient final), then reuse the mapping for every
-            #   subsequent partial + final.
-            #
-            #   Fallback: no diarize tag → fall back to embedding-on-final
-            #   (works for whisper.cpp, or Deepgram if diarization is off).
+            # Helper-laptop mode — a single mic carries both voices. Deepgram's
+            # server-side diarization is unreliable here: on one channel it
+            # routinely collapses two in-room voices into ONE tag
+            # ("unique_speakers=['0']"), which would force every turn to the
+            # same label. So we IGNORE event.diarize_speaker and do our own
+            # per-utterance voice work on the finalized clip:
+            #   • enrolled   → cluster locally; the enrolled anchor picks which
+            #                  cluster is the candidate       (_resolve_by_voice)
+            #   • no enroll  → cluster locally; label clusters behaviourally
+            #                  via the AutoLabeler          (_resolve_by_cluster)
+            # Partials (no PCM) and clips too short to embed keep the last known
+            # speaker. Cold-start mistakes self-correct as more speech arrives;
+            # the Swap button is the manual override.
             speaker = None
-            tag = event.diarize_speaker
-
-            # Anchor mode (candidate voice enrolled): decide who's who by
-            # RELATIVE voice similarity to the enrolled recording, not a fixed
-            # cutoff. Deepgram separates distinct voices into speaker tags; for
-            # each tag we track how close its voice is to the recording, and the
-            # tag CLOSEST to the recording is the candidate. A fixed threshold
-            # is unreliable both ways: the same person's similarity varies a lot
-            # across clips, and a different person can still score high — so only
-            # the relative ordering between the speakers present is trustworthy.
             anchor_mode = self.diarizer is not None and self.diarizer.has_anchor
             if anchor_mode:
-                speaker = self._resolve_by_voice(event, tag)
+                speaker = self._resolve_by_voice(event, event.diarize_speaker)
+            elif self.diarizer is not None and self.auto_labeler is not None:
+                speaker = self._resolve_by_cluster(event, text)
 
-            if not anchor_mode and tag is not None:
-                # Lazy-init the diarize-tag → label map.
-                if not hasattr(self, "_dg_speaker_map"):
-                    self._dg_speaker_map: dict[str, str] = {}
-
-                user_locked = getattr(self, "_dg_map_user_locked", False)
-
-                if tag in self._dg_speaker_map:
-                    speaker = self._dg_speaker_map[tag]
-                elif user_locked:
-                    # The user manually swapped — they want the existing mapping
-                    # preserved. A new tag here is the OTHER role.
-                    other = {"candidate", "interviewer"} - set(self._dg_speaker_map.values())
-                    speaker = other.pop() if other else "interviewer"
-                    self._dg_speaker_map[tag] = speaker
-                elif event.is_final and event.pcm and self.diarizer is not None and self.diarizer.has_anchor:
-                    # First time we see this tag with a usable final. ONLY lock
-                    # the mapping if the audio is long enough to embed reliably
-                    # — resemblyzer is unreliable on <1.5s clips. Until then we
-                    # use a tentative label but keep re-trying on each final.
-                    pcm_bytes = len(event.pcm)
-                    audio_seconds = pcm_bytes / (2 * self.cfg.sample_rate)  # int16 mono
-                    MIN_LOCK_SECONDS = 1.5
-                    try:
-                        label = self.diarizer.assign_labeled(event.pcm, self.cfg.sample_rate)
-                    except Exception:
-                        label = None
-                    if label and audio_seconds >= MIN_LOCK_SECONDS:
-                        self._dg_speaker_map[tag] = label
-                        speaker = label
-                        self.status.emit(
-                            f"Deepgram speaker '{tag}' identified as {label} "
-                            f"(via voice anchor, {audio_seconds:.1f}s of audio)."
-                        )
-                    elif label:
-                        # Tentative — show the label but don't lock.
-                        speaker = label
-                        self.status.emit(
-                            f"Speaker '{tag}' tentative '{label}' "
-                            f"({audio_seconds:.1f}s — need ≥{MIN_LOCK_SECONDS}s to lock). "
-                            f"Click Swap if wrong; speak more to confirm."
-                        )
-                # If we have ≥2 known tags and this is a new one, infer it's
-                # the OTHER role (someone different from the ones we know).
-                if speaker is None and self._dg_speaker_map:
-                    known_labels = set(self._dg_speaker_map.values())
-                    if "candidate" in known_labels and tag not in self._dg_speaker_map:
-                        self._dg_speaker_map[tag] = "interviewer"
-                        speaker = "interviewer"
-                        self.status.emit(f"Deepgram speaker '{tag}' assumed interviewer.")
-                    elif "interviewer" in known_labels and tag not in self._dg_speaker_map:
-                        self._dg_speaker_map[tag] = "candidate"
-                        speaker = "candidate"
-                        self.status.emit(f"Deepgram speaker '{tag}' assumed candidate.")
-                # If no anchor exists AND this is our first tag ever, default
-                # the first speaker we hear to "interviewer" (typical opening).
-                if speaker is None and not self._dg_speaker_map and event.is_final:
-                    self._dg_speaker_map[tag] = "interviewer"
-                    speaker = "interviewer"
-                    self.status.emit(
-                        f"Deepgram speaker '{tag}' defaulted to interviewer "
-                        f"(no voice enrollment — click Swap if wrong)."
-                    )
-
-            # Watchdog: if Deepgram finals keep coming with no speaker tag at
-            # all, diarization isn't actually running. Warn the user once.
-            if not anchor_mode and event.is_final and tag is None and effective_stt_engine(self.cfg) == "deepgram":
-                self._finals_seen_without_diarize += 1
-                if (self._finals_seen_without_diarize >= 3
-                        and not self._diarize_warning_emitted):
-                    self._diarize_warning_emitted = True
-                    self.status.emit(
-                        "⚠ Deepgram isn't tagging words with speaker IDs — "
-                        "diarization may not be supported by the selected model "
-                        f"({self.cfg.deepgram_model}) or your account tier. "
-                        "Labels will use a best-effort default; use Swap if wrong."
-                    )
-
-            # Fallback: partial (no PCM), a clip too short to embed, or — in
-            # non-anchor mode — no diarize tag. Keep the last known speaker;
-            # in non-anchor mode, try clustering / auto-labeler.
             if speaker is None:
                 speaker = getattr(self, "_helper_last_speaker", "interviewer")
-                if not anchor_mode and event.is_final and event.pcm and self.diarizer is not None:
-                    try:
-                        if self.diarizer.has_anchor:
-                            label = self.diarizer.assign_labeled(event.pcm, self.cfg.sample_rate)
-                        else:
-                            assert self.auto_labeler is not None
-                            cluster = self.diarizer.assign(event.pcm, self.cfg.sample_rate)
-                            label = (self.auto_labeler.observe(cluster, text, event.ts_end)
-                                     if cluster else None)
-                    except Exception:
-                        label = None
-                    if label:
-                        speaker = label
 
             self._helper_last_speaker = speaker
             if getattr(self, "_same_laptop_swap", False):

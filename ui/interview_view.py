@@ -1,11 +1,11 @@
 """Live interview view: collapsible transcript on the left, answer panel on the right."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton, QSplitter,
-    QTextEdit, QVBoxLayout, QWidget,
+    QAbstractSlider, QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar,
+    QPushButton, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -16,12 +16,92 @@ _DEFAULT_FONT = 16
 
 class _AnswerEdit(QTextEdit):
     """
-    QTextEdit with gentler mouse-wheel scrolling. Qt's default is 3 text lines
-    per wheel notch, and a "line" grows with the answer font — at 24-32px the
-    view leaps ~70-115px per notch, which reads as jumpy/too fast. Scroll
-    exactly ONE line per notch instead, and use the OS-provided pixel deltas
-    directly for touchpads (smooth by nature).
+    Read-only answer view with Notepad-style scrolling:
+
+    - Mouse wheel: exactly ONE line per notch (Qt's default is 3, and a "line"
+      grows with the font — at 24-32px the view leaps ~70-115px per notch).
+      Touchpad pixel deltas pass through untouched (smooth by nature).
+    - PageUp/PageDown and Up/Down arrows scroll by whole lines / whole pages.
+    - After any discrete scroll (page keys, arrows, scrollbar trough click or
+      arrow buttons), the top visible line is snapped flush with the top edge
+      so the first line is never cropped. Snapping uses exact glyph geometry,
+      so it's correct regardless of document margins or wrapped lines.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        sb = self.verticalScrollBar()
+        # Line up the top line after the scrollbar's own actions (trough click
+        # pages a screenful; arrow buttons step a line). actionTriggered fires
+        # BEFORE Qt applies the action, so snap on the next event-loop turn.
+        sb.actionTriggered.connect(self._on_scroll_action)
+        self._sync_steps()
+
+    # ── geometry helpers ─────────────────────────────────────────────────────
+    def _line_height(self) -> int:
+        return max(1, self.fontMetrics().lineSpacing())
+
+    def _sync_steps(self) -> None:
+        """Keep the scrollbar's step sizes in whole lines (font/size aware)."""
+        sb = self.verticalScrollBar()
+        lh = self._line_height()
+        sb.setSingleStep(lh)
+        vh = self.viewport().height()
+        sb.setPageStep(max(lh, (max(1, vh // lh) - 1) * lh))
+
+    def _align_top_line(self) -> None:
+        """Scroll minimally so the top visible line sits flush with the top."""
+        cur = self.cursorForPosition(QPoint(2, 2))
+        top = self.cursorRect(cur).top()
+        if top != 0:
+            sb = self.verticalScrollBar()
+            sb.setValue(sb.value() + top)
+
+    def _scroll_lines(self, n: int) -> None:
+        sb = self.verticalScrollBar()
+        sb.setValue(sb.value() + n * self._line_height())
+        self._align_top_line()
+
+    def _page(self, direction: int) -> None:
+        vh = self.viewport().height()
+        lines = max(1, vh // self._line_height() - 1)   # keep one line of overlap
+        self._scroll_lines(direction * lines)
+
+    # ── events ───────────────────────────────────────────────────────────────
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_steps()
+
+    def _on_scroll_action(self, action) -> None:
+        # actionTriggered delivers a plain int; compare as int (it does NOT
+        # equality-match the SliderAction enum members under PySide6). Align
+        # after every discrete action (trough page, arrow-button step, ends) —
+        # i.e. everything except a free thumb drag (SliderMove) and no-op.
+        A = QAbstractSlider.SliderAction
+        skip = (A.SliderNoAction.value, A.SliderMove.value)
+        av = getattr(action, "value", action)   # signal may deliver int or enum
+        if av not in skip:
+            # Let Qt apply the step/page first, then snap the top line flush.
+            QTimer.singleShot(0, self._align_top_line)
+
+    def keyPressEvent(self, event):
+        mods = event.modifiers()
+        plain = not (mods & (
+            Qt.KeyboardModifier.ShiftModifier      # preserve shift-select
+            | Qt.KeyboardModifier.ControlModifier  # preserve Ctrl+Home/End, Ctrl+C
+            | Qt.KeyboardModifier.AltModifier
+        ))
+        if plain:
+            k = event.key()
+            if k == Qt.Key.Key_PageDown:
+                self._page(1); event.accept(); return
+            if k == Qt.Key.Key_PageUp:
+                self._page(-1); event.accept(); return
+            if k == Qt.Key.Key_Down:
+                self._scroll_lines(1); event.accept(); return
+            if k == Qt.Key.Key_Up:
+                self._scroll_lines(-1); event.accept(); return
+        super().keyPressEvent(event)
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -32,7 +112,7 @@ class _AnswerEdit(QTextEdit):
         pixels = event.pixelDelta().y()
         if not pixels:
             notches = event.angleDelta().y() / 120.0
-            pixels = int(notches * self.fontMetrics().lineSpacing())
+            pixels = int(notches * self._line_height())
         if pixels:
             sb.setValue(sb.value() - pixels)
             event.accept()
@@ -355,6 +435,8 @@ class InterviewView(QWidget):
         self.answer.setStyleSheet(
             f"QTextEdit#answer {{ font-size: {self.font_size}px; }}"
         )
+        # Line-height changed → refresh the scrollbar's whole-line step sizes.
+        self.answer._sync_steps()
         self.font_size_label.setText(f"{self.font_size}px")
 
     # ── collapse / expand ────────────────────────────────────────────────────

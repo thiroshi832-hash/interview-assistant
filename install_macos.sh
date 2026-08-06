@@ -15,29 +15,40 @@ set -euo pipefail
 VENV_DIR=".venv"
 
 # ── Find a compatible Python (3.9–3.12) ──────────────────────────────────
-# PySide6 requires Python <3.13. Homebrew's default `python3` may be 3.13+,
-# so we look for an explicit 3.12 or 3.11 first.
+# PySide6 requires Python <3.13. Homebrew's python3.12 can get Killed:9 on
+# older macOS, so we prefer the python.org framework build first.
+_try_python() {
+    # Verify the candidate actually runs (Homebrew Python gets SIGKILL'd on
+    # older macOS). Redirect stderr so "Killed" noise doesn't confuse users.
+    "$1" -c "import sys; sys.exit(0)" 2>/dev/null
+}
+
 PYTHON=""
-for candidate in python3.12 python3.11 python3.10 python3.9; do
-    if command -v "$candidate" &>/dev/null; then
-        PYTHON="$candidate"
+# 1) python.org framework builds (most reliable on older macOS)
+for ver in 3.12 3.11 3.10 3.9; do
+    fw="/Library/Frameworks/Python.framework/Versions/$ver/bin/python$ver"
+    if [ -x "$fw" ] && _try_python "$fw"; then
+        PYTHON="$fw"
         break
     fi
 done
+# 2) PATH-based candidates (Homebrew, pyenv, etc.)
 if [ -z "$PYTHON" ]; then
-    # Fall back to python3 and check version
-    if ! command -v python3 &>/dev/null; then
-        echo "Error: python3 not found. Install via: brew install python@3.12"
-        exit 1
-    fi
-    PY_VER=$(python3 -c 'import sys; print(sys.version_info.minor)')
-    if [ "$PY_VER" -ge 13 ]; then
-        echo "Error: Python 3.$PY_VER detected, but PySide6 requires Python <3.13."
-        echo "Install Python 3.12:  brew install python@3.12"
-        echo "Then re-run this script."
-        exit 1
-    fi
-    PYTHON="python3"
+    for candidate in python3.12 python3.11 python3.10 python3.9 python3; do
+        if command -v "$candidate" &>/dev/null && _try_python "$candidate"; then
+            PY_VER=$("$candidate" -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo "0")
+            if [ "$PY_VER" -lt 13 ]; then
+                PYTHON="$candidate"
+                break
+            fi
+        fi
+    done
+fi
+if [ -z "$PYTHON" ]; then
+    echo "Error: No working Python 3.9–3.12 found."
+    echo "Install from https://www.python.org/downloads/ (the macOS universal installer)"
+    echo "or via: brew install python@3.12"
+    exit 1
 fi
 
 echo "Using: $PYTHON ($($PYTHON --version))"

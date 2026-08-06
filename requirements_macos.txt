@@ -18,8 +18,10 @@ PyAudio>=0.2.14
 websockets>=12.0
 
 # ── DSP ───────────────────────────────────────────────────────────────────
-numpy>=1.26
-scipy>=1.11
+# numpy 2.x links to macOS 14's Accelerate framework — crashes on macOS 11.
+# numpy 1.26.x bundles OpenBLAS and has macOS 11 arm64 wheels.
+numpy>=1.26,<2
+scipy>=1.11,<1.14
 
 # ── VAD ───────────────────────────────────────────────────────────────────
 # silero-vad ONNX file is bundled in assets/. We hit it directly via onnxruntime.

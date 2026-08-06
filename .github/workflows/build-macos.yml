@@ -7,6 +7,12 @@ jobs:
   build:
     runs-on: macos-14  # Apple Silicon runner (M1), macOS 14
 
+    env:
+      # Target macOS 11 so the built app runs on Big Sur and later.
+      # _PYTHON_HOST_PLATFORM makes pip prefer macOS 11-compatible wheels.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      _PYTHON_HOST_PLATFORM: "macosx-11.0-arm64"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -16,7 +22,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install system dependencies
-        run: brew install portaudio
+        run: |
+          brew install portaudio
+          brew install gcc
 
       - name: Install Python dependencies
         run: |
@@ -25,7 +33,7 @@ jobs:
           pip install --no-deps resemblyzer
 
       - name: Verify imports
-        run: python -c "import PySide6, scipy, pyaudio, anthropic; print('All deps OK')"
+        run: python -c "import PySide6, scipy, numpy, pyaudio, anthropic; print('All deps OK')"
 
       - name: Generate .icns icon
         run: python scripts/make_icns.py

@@ -52,8 +52,19 @@ echo "[2/5] Creating virtual environment..."
 if [ -d "$VENV_DIR" ]; then
     rm -rf "$VENV_DIR"
 fi
-"$PYTHON" -m venv "$VENV_DIR"
-source "$VENV_DIR/bin/activate"
+# On some macOS + Homebrew Python combos, `python -m venv` gets killed by
+# the system (Killed: 9) during the ensurepip step. Work around by creating
+# the venv without pip, then bootstrapping pip via get-pip.py.
+if ! "$PYTHON" -m venv "$VENV_DIR" 2>/dev/null; then
+    echo "  Standard venv failed — trying --without-pip workaround..."
+    "$PYTHON" -m venv --without-pip "$VENV_DIR"
+    source "$VENV_DIR/bin/activate"
+    curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py
+    python /tmp/_get_pip.py --quiet
+    rm -f /tmp/_get_pip.py
+else
+    source "$VENV_DIR/bin/activate"
+fi
 
 echo "[3/5] Installing main dependencies + PyInstaller..."
 pip install --disable-pip-version-check -r requirements_macos.txt

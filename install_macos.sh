@@ -3,7 +3,7 @@
 # Usage:  chmod +x install_macos.sh && ./install_macos.sh
 #
 # Prerequisites:
-#   - Python 3.10+ (brew install python@3.12)
+#   - Python 3.9–3.12 (PySide6 does not yet support 3.13+)
 #   - PortAudio (brew install portaudio)
 #   - For system audio loopback: BlackHole (brew install blackhole-2ch)
 #
@@ -14,20 +14,45 @@ set -euo pipefail
 
 VENV_DIR=".venv"
 
-echo "[1/5] Checking prerequisites..."
-if ! command -v python3 &>/dev/null; then
-    echo "Error: python3 not found. Install via: brew install python@3.12"
-    exit 1
+# ── Find a compatible Python (3.9–3.12) ──────────────────────────────────
+# PySide6 requires Python <3.13. Homebrew's default `python3` may be 3.13+,
+# so we look for an explicit 3.12 or 3.11 first.
+PYTHON=""
+for candidate in python3.12 python3.11 python3.10 python3.9; do
+    if command -v "$candidate" &>/dev/null; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+if [ -z "$PYTHON" ]; then
+    # Fall back to python3 and check version
+    if ! command -v python3 &>/dev/null; then
+        echo "Error: python3 not found. Install via: brew install python@3.12"
+        exit 1
+    fi
+    PY_VER=$(python3 -c 'import sys; print(sys.version_info.minor)')
+    if [ "$PY_VER" -ge 13 ]; then
+        echo "Error: Python 3.$PY_VER detected, but PySide6 requires Python <3.13."
+        echo "Install Python 3.12:  brew install python@3.12"
+        echo "Then re-run this script."
+        exit 1
+    fi
+    PYTHON="python3"
 fi
+
+echo "Using: $PYTHON ($($PYTHON --version))"
+
+echo "[1/5] Checking prerequisites..."
 if ! brew list portaudio &>/dev/null 2>&1; then
-    echo "Warning: portaudio not found. Installing via Homebrew..."
+    echo "portaudio not found. Installing via Homebrew..."
     brew install portaudio
 fi
 
 echo "[2/5] Creating virtual environment..."
-if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv "$VENV_DIR"
+if [ -d "$VENV_DIR" ]; then
+    rm -rf "$VENV_DIR"
 fi
+"$PYTHON" -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 
 echo "[3/5] Installing main dependencies + PyInstaller..."

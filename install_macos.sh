@@ -58,11 +58,15 @@ if ! brew list portaudio &>/dev/null 2>&1; then
     echo "portaudio not found. Installing via Homebrew..."
     brew install portaudio
 fi
-# scipy (and other packages) need clang >= 15 to build from source when no
-# pre-built wheel exists for this macOS version. Homebrew LLVM provides it.
+# scipy needs clang >= 15 and gfortran to build from source when no
+# pre-built wheel exists for this macOS version.
 if ! brew list llvm &>/dev/null 2>&1; then
     echo "llvm not found. Installing via Homebrew (needed to compile scipy)..."
     brew install llvm
+fi
+if ! command -v gfortran &>/dev/null; then
+    echo "gfortran not found. Installing gcc via Homebrew (needed to compile scipy)..."
+    brew install gcc
 fi
 
 echo "[2/5] Creating virtual environment..."

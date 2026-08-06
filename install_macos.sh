@@ -47,6 +47,12 @@ if ! brew list portaudio &>/dev/null 2>&1; then
     echo "portaudio not found. Installing via Homebrew..."
     brew install portaudio
 fi
+# scipy (and other packages) need clang >= 15 to build from source when no
+# pre-built wheel exists for this macOS version. Homebrew LLVM provides it.
+if ! brew list llvm &>/dev/null 2>&1; then
+    echo "llvm not found. Installing via Homebrew (needed to compile scipy)..."
+    brew install llvm
+fi
 
 echo "[2/5] Creating virtual environment..."
 if [ -d "$VENV_DIR" ]; then
@@ -67,6 +73,13 @@ else
 fi
 
 echo "[3/5] Installing main dependencies + PyInstaller..."
+# Use Homebrew LLVM if the system clang is too old for scipy's build.
+LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || true)"
+if [ -n "$LLVM_PREFIX" ] && [ -d "$LLVM_PREFIX/bin" ]; then
+    export CC="$LLVM_PREFIX/bin/clang"
+    export CXX="$LLVM_PREFIX/bin/clang++"
+    echo "  Using LLVM clang: $CC"
+fi
 pip install --disable-pip-version-check -r requirements_macos.txt
 pip install --disable-pip-version-check pyinstaller
 

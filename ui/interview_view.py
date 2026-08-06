@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 
 
 _MIN_FONT = 11
-_MAX_FONT = 32
+_MAX_FONT = 128
 _DEFAULT_FONT = 16
 
 

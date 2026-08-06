@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
+from audio.pyaudio_compat import get_loopback_devices, loopback_hint, loopback_footer_hint
 from config import Config
 from ui.style import STYLE
 
@@ -42,10 +43,7 @@ class AudioDeviceDialog(QDialog):
         title.setStyleSheet("font-size: 15px; font-weight: bold;")
         layout.addWidget(title)
 
-        hint = QLabel(
-            "Pick the microphone for your voice and the Windows loopback device "
-            "that carries the interviewer's audio."
-        )
+        hint = QLabel(loopback_hint())
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -80,10 +78,7 @@ class AudioDeviceDialog(QDialog):
             err.setStyleSheet("color: #f38ba8;")
             layout.addWidget(err)
 
-        footer = QLabel(
-            "Tip: if Zoom/Teams/Meet is routed to a specific speaker in Windows "
-            "Volume Mixer, choose that speaker's loopback here."
-        )
+        footer = QLabel(loopback_footer_hint())
         footer.setObjectName("hint")
         footer.setWordWrap(True)
         layout.addWidget(footer)
@@ -102,18 +97,15 @@ class AudioDeviceDialog(QDialog):
 
     def _load_devices(self) -> None:
         try:
-            import pyaudiowpatch as pyaudio  # type: ignore
+            from audio.pyaudio_compat import pyaudio as pa_mod
 
-            pa = pyaudio.PyAudio()
+            pa = pa_mod.PyAudio()
             try:
                 for i in range(pa.get_device_count()):
                     info = pa.get_device_info_by_index(i)
                     if int(info.get("maxInputChannels", 0) or 0) > 0:
                         self._inputs.append(info)
-                try:
-                    self._loopbacks = list(pa.get_loopback_device_info_generator())  # type: ignore[attr-defined]
-                except Exception:
-                    self._loopbacks = []
+                self._loopbacks = get_loopback_devices(pa)
             finally:
                 pa.terminate()
         except Exception as e:

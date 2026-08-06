@@ -1,7 +1,15 @@
 """Shared stylesheet — Catppuccin-inspired dark theme, easy on the eyes."""
+import sys
 
-STYLE = """
-* { font-family: "Segoe UI"; font-size: 13px; }
+_FONT_FAMILY = (
+    '"Segoe UI"' if sys.platform == "win32"
+    else '".AppleSystemUIFont", "Helvetica Neue"' if sys.platform == "darwin"
+    else '"Ubuntu", "Noto Sans", sans-serif'
+)
+
+STYLE = (
+    "* { font-family: " + _FONT_FAMILY + "; font-size: 13px; }\n"
+    """
 QMainWindow, QDialog, QWidget { background: #1e1e2e; color: #cdd6f4; }
 
 QGroupBox {
@@ -44,3 +52,4 @@ QLabel#answer { font-size: 16px; line-height: 1.6; }
 QScrollBar:vertical { background: #1e1e2e; width: 10px; }
 QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; min-height: 20px; }
 """
+)

@@ -9,7 +9,7 @@ import time
 from typing import Callable, Optional
 
 import numpy as np
-import pyaudiowpatch as pyaudio  # type: ignore
+from audio.pyaudio_compat import pyaudio
 
 from audio._pcm import to_mono_16k_int16
 

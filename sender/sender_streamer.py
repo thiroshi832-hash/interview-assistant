@@ -22,8 +22,7 @@ import time
 from typing import Callable, Optional
 
 import numpy as np
-import pyaudiowpatch as pyaudio  # type: ignore
-
+from audio.pyaudio_compat import pyaudio, get_loopback_devices, get_default_loopback, no_loopback_error
 from audio._pcm import to_mono_16k_int16
 
 
@@ -246,10 +245,7 @@ class SenderStreamer:
         # Loopback stream → tag 0x02 (interviewer)
         loopback = self._get_loopback_device(self._loop_idx)
         if loopback is None:
-            raise RuntimeError(
-                "No WASAPI loopback device found. Make sure system audio "
-                "isn't muted and you're on Windows."
-            )
+            raise RuntimeError(no_loopback_error())
         loop_rate = int(loopback["defaultSampleRate"])
         loop_channels = int(loopback["maxInputChannels"]) or 2
         self._loop_stream = self._pa.open(
@@ -342,24 +338,12 @@ class SenderStreamer:
         assert self._pa is not None
         if index is not None:
             try:
-                for info in self._pa.get_loopback_device_info_generator():  # type: ignore[attr-defined]
+                for info in get_loopback_devices(self._pa):
                     if int(info.get("index", -1)) == int(index):
                         return info
             except Exception:
                 pass
-        try:
-            return self._pa.get_default_wasapi_loopback()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        try:
-            default_out = self._pa.get_default_output_device_info()
-            name = default_out["name"]
-            for d in self._pa.get_loopback_device_info_generator():  # type: ignore[attr-defined]
-                if name in d["name"]:
-                    return d
-        except Exception:
-            pass
-        return None
+        return get_default_loopback(self._pa)
 
     # ── device enumeration helpers (used by the UI) ──────────────────────
     @staticmethod
@@ -386,16 +370,13 @@ class SenderStreamer:
                         "channels": ch_in,
                         "rate": int(info["defaultSampleRate"]),
                     })
-            try:
-                for info in pa.get_loopback_device_info_generator():  # type: ignore[attr-defined]
-                    loopbacks.append({
-                        "index": int(info["index"]),
-                        "name": str(info["name"]),
-                        "channels": int(info.get("maxInputChannels", 2) or 2),
-                        "rate": int(info["defaultSampleRate"]),
-                    })
-            except Exception:
-                pass
+            for info in get_loopback_devices(pa):
+                loopbacks.append({
+                    "index": int(info["index"]),
+                    "name": str(info["name"]),
+                    "channels": int(info.get("maxInputChannels", 2) or 2),
+                    "rate": int(info["defaultSampleRate"]),
+                })
         finally:
             try:
                 pa.terminate()

@@ -2,7 +2,8 @@
 Same-laptop audio source: captures the mic and the system loopback in parallel,
 tags chunks with their known speaker.
 
-Requires pyaudiowpatch (PyAudio fork with WASAPI loopback support, Windows-only).
+On Windows uses pyaudiowpatch (WASAPI loopback). On macOS uses standard pyaudio
+with a virtual audio device (e.g. BlackHole) for system audio capture.
 """
 from __future__ import annotations
 
@@ -10,8 +11,7 @@ import threading
 import time
 from typing import Optional
 
-import pyaudiowpatch as pyaudio  # type: ignore
-
+from audio.pyaudio_compat import pyaudio, get_loopback_devices, get_default_loopback, no_loopback_error
 from audio.source import AudioChunk, AudioSource
 from audio._pcm import to_mono_16k_int16
 from config import Config
@@ -60,10 +60,7 @@ class DualStreamSource(AudioSource):
         # ── loopback stream ───────────────────────────────────────────────
         loopback = self._get_loopback_device(self.cfg.loopback_device_index)
         if loopback is None:
-            raise RuntimeError(
-                "No WASAPI loopback device found. Make sure you're on Windows and "
-                "system audio is not muted."
-            )
+            raise RuntimeError(no_loopback_error())
         loop_rate = int(loopback["defaultSampleRate"])
         loop_channels = int(loopback["maxInputChannels"]) or 2
         self._loop_stream = self._pa.open(
@@ -111,35 +108,16 @@ class DualStreamSource(AudioSource):
         return self._pa.get_default_input_device_info()
 
     def _get_loopback_device(self, index: int | None):
-        """Return the configured WASAPI loopback device, falling back to default output."""
+        """Return the configured loopback device, falling back to platform default."""
         assert self._pa is not None
         if index is not None:
             try:
-                for info in self._pa.get_loopback_device_info_generator():  # type: ignore[attr-defined]
+                for info in get_loopback_devices(self._pa):
                     if int(info.get("index", -1)) == int(index):
                         return info
             except Exception:
                 pass
-        return self._find_default_loopback()
-
-    def _find_default_loopback(self):
-        """Find the loopback device that mirrors the default output."""
-        assert self._pa is not None
-        try:
-            default_out = self._pa.get_default_wasapi_loopback()  # type: ignore[attr-defined]
-            return default_out
-        except Exception:
-            pass
-        # Fallback: scan
-        try:
-            default_out = self._pa.get_default_output_device_info()
-            name = default_out["name"]
-            for d in self._pa.get_loopback_device_info_generator():  # type: ignore[attr-defined]
-                if name in d["name"]:
-                    return d
-        except Exception:
-            pass
-        return None
+        return get_default_loopback(self._pa)
 
     def _reader(self, stream, rate: int, channels: int, fmt: str, speaker: str) -> None:
         target_rate = self.cfg.sample_rate

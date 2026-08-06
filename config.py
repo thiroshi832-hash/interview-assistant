@@ -61,7 +61,7 @@ class Config:
     sample_rate: int = 16000
     chunk_ms: int = 30
     mic_device_index: int | None = None       # PyAudio input device index; None = default mic
-    loopback_device_index: int | None = None  # PyAudio WASAPI loopback index; None = default output loopback
+    loopback_device_index: int | None = None  # Loopback device index (WASAPI on Windows, virtual audio on macOS)
 
     # ── Network audio (helper-network mode) ───────────────────────────────────
     # When mode == MODE_HELPER_NETWORK, the receiver connects to the sender
@@ -96,6 +96,9 @@ class Config:
     # ── UI ────────────────────────────────────────────────────────────────────
     answer_font_size: int = 16               # pixels; the A− / A+ buttons persist here
     transcript_collapsed: bool = False
+    # Last resume file loaded via Setup. Auto-loaded on next launch if the file
+    # still exists — saves the user from repicking the same PDF every session.
+    resume_path: str = ""
 
     # ── Interview metadata (filled in by the UI before "Start") ───────────────
     job_title: str = ""

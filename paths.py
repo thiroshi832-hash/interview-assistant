@@ -26,5 +26,5 @@ def asset(*parts: str) -> str:
 
 
 def icon_path(ext: str = "png") -> str:
-    """Path to the app icon. `ext` is 'png' (Qt) or 'ico' (Windows .exe)."""
+    """Path to the app icon. `ext` is 'png' (Qt), 'ico' (Windows), or 'icns' (macOS)."""
     return asset(f"aetherstack-icon.{ext}")

@@ -44,6 +44,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from audio.pyaudio_compat import tray_not_available_message
 from paths import icon_path
 from sender.sender_streamer import SenderStreamer
 from ui.style import STYLE
@@ -141,7 +142,9 @@ class SettingsDialog(QDialog):
         # IP list — copy/paste handy
         ips = SenderStreamer.local_ips()
         ip_label = QLabel("  ".join(ips) if ips else "(no LAN address found)")
-        ip_label.setStyleSheet("font-family: 'Consolas'; color: #a6e3a1;")
+        import sys as _sys
+        _mono = "'Consolas'" if _sys.platform == "win32" else "'Menlo', 'SF Mono'" if _sys.platform == "darwin" else "'monospace'"
+        ip_label.setStyleSheet(f"font-family: {_mono}; color: #a6e3a1;")
         ip_label.setWordWrap(True)
         ip_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         form2 = QFormLayout()
@@ -261,8 +264,6 @@ class SenderTrayApp(QObject):
 
     # ── Tray interactions ────────────────────────────────────────────────
     def _on_tray_activated(self, reason) -> None:
-        # Left-click toggles streaming (handy when the menu would be slow);
-        # Windows uses Trigger for left, Context for right.
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._toggle()
 
@@ -375,8 +376,7 @@ def main() -> int:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             QMessageBox.critical(
                 None, "AetherStack Sender",
-                "System tray is not available on this system. "
-                "Enable tray icons in Windows settings and try again.",
+                tray_not_available_message(),
             )
             return 1
 

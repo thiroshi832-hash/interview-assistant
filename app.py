@@ -42,6 +42,7 @@ from pipeline.stt_backend import STTEvent
 from pipeline.stt_engines import make_stt_backend
 from pipeline.transcript import Transcript
 from pipeline.vad import Segmenter, Utterance
+from audio.pyaudio_compat import audio_watchdog_message
 from paths import icon_path
 from pipeline.license import is_valid_license, trial_expired
 from ui.evaluation_dialog import EvaluationDialog
@@ -64,6 +65,13 @@ CANDIDATE_GRACE_SEC = 4.0
 #   (b) the user hits the manual hotkey / Regenerate button.
 # Prevents the silence net from firing while the candidate is mid-answer.
 POST_ANSWER_COOLDOWN_SEC = 25.0
+
+# A mid-question breath longer than vad_silence_ms closes the VAD segment
+# and produces two finals for one question. Before firing an answer on a
+# detected-question final, wait this long — if another interviewer final
+# arrives inside the window, cancel and re-arm so both segments coalesce
+# into one LLM call instead of two.
+QUESTION_DEBOUNCE_MS = 700
 
 
 class App(QObject):
@@ -209,12 +217,7 @@ class App(QObject):
             if self._stop.is_set():
                 return
             if self.segmenter.first_chunk_at is None:
-                self.status.emit(
-                    "⚠ No audio detected — check (1) Windows Sound settings → "
-                    "Input device, (2) Settings → Privacy → Microphone → "
-                    "'Allow desktop apps to access your microphone', "
-                    "(3) the mic isn't muted in the volume mixer."
-                )
+                self.status.emit(audio_watchdog_message())
         threading.Thread(target=_audio_watchdog, daemon=True).start()
 
     def stop(self) -> None:
@@ -235,6 +238,29 @@ class App(QObject):
             pass
 
     # ── silence-based trigger ────────────────────────────────────────────
+    def _arm_answer_debounce(self, turn) -> None:
+        """
+        Fire `_launch_answer` after QUESTION_DEBOUNCE_MS unless another
+        interviewer final arrives first. Used on the question-detected path
+        to coalesce a question broken into two VAD segments by a short
+        mid-sentence breath.
+        """
+        self._cancel_silence_timer()
+        delay = QUESTION_DEBOUNCE_MS / 1000.0
+
+        def fire():
+            if time.time() < self._candidate_speaking_until:
+                self._arm_answer_debounce(turn)
+                return
+            if self.segmenter.is_anyone_speaking():
+                self._arm_answer_debounce(turn)
+                return
+            self._launch_answer()
+
+        self._silence_timer = threading.Timer(delay, fire)
+        self._silence_timer.daemon = True
+        self._silence_timer.start()
+
     def _arm_silence_timer(self, turn) -> None:
         """
         Fire `_launch_answer` after `question_silence_ms` of inactivity unless
@@ -487,8 +513,7 @@ class App(QObject):
 
         candidate_speaking = time.time() < self._candidate_speaking_until
         if self.qdetect.should_answer(turn, candidate_speaking=candidate_speaking):
-            self._cancel_silence_timer()
-            self._launch_answer()
+            self._arm_answer_debounce(turn)
         else:
             in_cooldown = (
                 not self._candidate_spoke_since_answer

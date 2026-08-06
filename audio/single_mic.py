@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Optional
 
-import pyaudiowpatch as pyaudio  # type: ignore
+from audio.pyaudio_compat import pyaudio
 
 from audio.source import AudioChunk, AudioSource
 from audio._pcm import to_mono_16k_int16

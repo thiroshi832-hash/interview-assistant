@@ -108,6 +108,10 @@ class SetupView(QWidget):
 
         outer.addWidget(resume_box)
 
+        # Auto-load the previously used resume if the file still exists on
+        # disk. Any parse / IO failure is silent — user can just pick again.
+        self._autoload_saved_resume()
+
         # ── job ──
         job_box = QGroupBox("Role")
         form = QFormLayout(job_box)
@@ -153,8 +157,15 @@ class SetupView(QWidget):
         outer.addWidget(self.btn_start)
 
     def _load_resume(self):
+        # Start the file picker in the directory of the last-loaded resume
+        # if there was one — most people keep their resume in one place.
+        start_dir = ""
+        if self.cfg.resume_path:
+            parent = Path(self.cfg.resume_path).parent
+            if parent.exists():
+                start_dir = str(parent)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load resume", "", "Documents (*.pdf *.docx *.txt *.md)"
+            self, "Load resume", start_dir, "Documents (*.pdf *.docx *.txt *.md)"
         )
         if not path:
             return
@@ -162,6 +173,20 @@ class SetupView(QWidget):
             text = load_resume(path)
         except Exception as e:
             QMessageBox.warning(self, "Could not load resume", str(e))
+            return
+        self._resume_text = text
+        self.txt_preview.setPlainText(text)
+        self.lbl_status.setText(f"Loaded: {Path(path).name}  ({len(text)} chars)")
+        self.cfg.resume_path = path
+        self.cfg.save()
+
+    def _autoload_saved_resume(self) -> None:
+        path = self.cfg.resume_path
+        if not path or not Path(path).is_file():
+            return
+        try:
+            text = load_resume(path)
+        except Exception:
             return
         self._resume_text = text
         self.txt_preview.setPlainText(text)

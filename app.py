@@ -709,19 +709,23 @@ class App(QObject):
     # ── running context summary ─────────────────────────────────────────────
     def _maybe_update_summary(self) -> None:
         """
-        Kick a background summary update once enough finalized turns have
-        aged out of the rolling window (`cfg.rolling_turns`) to be worth
-        folding in. Batched (cfg.summary_fold_batch) and async so it never
-        adds latency to a live answer — see pipeline/context_summary.py.
+        Safety valve for the full-transcript memory: only when the verbatim
+        conversation exceeds cfg.context_token_budget do we fold the OLDEST
+        turns into the running summary (keeping >= cfg.min_verbatim_turns recent
+        turns verbatim). Async so it never adds latency to a live answer, and
+        the fold cursor only advances when the summary is ready — so a folded
+        turn never disappears from the prompt before the summary replaces it.
         """
         if self._summarizing:
             return
         finals = self.transcript.snapshot_finalized()
-        if not self._summarizer.should_update(finals, self.cfg.rolling_turns, self.cfg.summary_fold_batch):
+        to_fold = self._summarizer.turns_to_fold(
+            finals, self.cfg.context_token_budget, self.cfg.min_verbatim_turns
+        )
+        if not to_fold:
             return
-        pending = self._summarizer.pending_turns(finals, self.cfg.rolling_turns)
         self._summarizing = True
-        threading.Thread(target=self._summary_worker, args=(pending,), daemon=True).start()
+        threading.Thread(target=self._summary_worker, args=(to_fold,), daemon=True).start()
 
     def _summary_worker(self, pending) -> None:
         try:
@@ -799,9 +803,13 @@ class App(QObject):
 
         parts: list[str] = []   # everything shown to the user → Q&A log
 
+        # Send the WHOLE conversation verbatim (everything not yet folded into
+        # the summary) — not a fixed-size window. `summary` is empty unless the
+        # marathon-length safety valve has fired.
+        verbatim = self._summarizer.unfolded(turns)
         try:
             for chunk in self.llm.stream_answer(
-                turns, deep=deep, style_hint=style_hint, summary=self._summarizer.summary,
+                verbatim, deep=deep, style_hint=style_hint, summary=self._summarizer.summary,
             ):
                 if cancel.is_set():
                     break

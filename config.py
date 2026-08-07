@@ -112,13 +112,15 @@ class Config:
     question_silence_ms: int = 1200          # interviewer-finished-talking heuristic (silence-net trigger)
 
     # ── Conversation context ──────────────────────────────────────────────────
-    rolling_turns: int = 8                   # how many prior turns to send to Claude verbatim
-    # Turns older than `rolling_turns` are folded into a running summary
-    # (pipeline/context_summary.py) instead of being dropped outright, so the
-    # model keeps some memory of the whole interview at ~constant per-answer
-    # cost. This batches how many aged-out turns accumulate before paying for
-    # one (cheap) summarization call, instead of updating on every turn.
-    summary_fold_batch: int = 6
+    # The WHOLE conversation is sent verbatim on every answer — a full interview
+    # fits comfortably in the model's context, and the resume/role prefix is
+    # prompt-cached. Compression is only a safety valve for marathon sessions:
+    # once the verbatim transcript exceeds `context_token_budget` tokens, the
+    # OLDEST turns are folded into a running summary (pipeline/context_summary.py),
+    # always leaving at least `min_verbatim_turns` recent turns verbatim.
+    # (Token count is a cheap len//4 estimate — no tokenizer dependency.)
+    context_token_budget: int = 6000
+    min_verbatim_turns: int = 12
 
     # ── UI ────────────────────────────────────────────────────────────────────
     answer_font_size: int = 16               # pixels; the A− / A+ buttons persist here

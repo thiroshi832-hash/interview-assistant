@@ -226,8 +226,10 @@ class OpenAIClient:
         if not turns:
             return "Provide a brief self-introduction in the candidate's voice based on the resume."
 
+        # Full conversation, oldest first (the controller already trims only
+        # what's been folded into `summary`; everything else is sent verbatim).
         lines = []
-        for t in turns[-self.cfg.rolling_turns:]:
+        for t in turns:
             label = "INTERVIEWER" if t.speaker == "interviewer" else "CANDIDATE"
             lines.append(f"[{label}] {t.text.strip()}")
         transcript = "\n".join(lines)

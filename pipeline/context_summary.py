@@ -1,13 +1,12 @@
 """
-Running summary of interview turns that have aged out of the rolling
-transcript window sent to the LLM on every answer.
+Running summary as a SAFETY VALVE for the full-transcript memory model.
 
-`rolling_turns` (see config.py) keeps each answer prompt cheap and fast, but
-on its own it means the model has zero memory of anything before the last
-few exchanges. This fills that gap without paying for the full verbatim
-transcript on every call: once enough finalized turns have fallen out of the
-window, they're folded into a short running summary via one cheap LLM call,
-and the summary — not the raw turns — carries that older context forward.
+The whole conversation is sent verbatim on every answer (a full interview fits
+the model's context, and the resume/role prefix is prompt-cached). We only
+compress when the verbatim transcript grows past a token budget: the OLDEST
+turns are folded into a short running summary via one cheap LLM call, always
+leaving at least `min_verbatim` recent turns verbatim. For most interviews the
+valve never fires and nothing is compressed — the model sees the exact words.
 
 Turns are matched by `ts` rather than list index/count, so eviction from the
 transcript's bounded deque (see pipeline/transcript.py, max_turns=200) can
@@ -20,7 +19,12 @@ from typing import Sequence
 from pipeline.types import Turn
 
 
-SUMMARY_MAX_WORDS = 150
+SUMMARY_MAX_WORDS = 250
+
+
+def _est_tokens(turns: Sequence[Turn]) -> int:
+    """Cheap token estimate (~4 chars/token) — avoids a tokenizer dependency."""
+    return sum(len(t.text) for t in turns) // 4
 
 UPDATE_PROMPT = """You maintain a running memory of an ongoing job interview for an answer-assistant that only sees the last few exchanges verbatim. Your summary is how it stays consistent with what's already been said.
 
@@ -58,26 +62,42 @@ class ContextSummarizer:
         self.summary: str = ""
         self._folded_up_to_ts: float = 0.0
 
-    def pending_turns(self, finalized_turns: Sequence[Turn], keep_last: int) -> list[Turn]:
-        """
-        Finalized turns old enough to fall outside the rolling window
-        (`keep_last`) that haven't been folded into the summary yet.
-        """
-        cutoff = max(0, len(finalized_turns) - keep_last)
-        older = finalized_turns[:cutoff]
-        return [t for t in older if t.ts > self._folded_up_to_ts]
+    def unfolded(self, turns: Sequence[Turn]) -> list[Turn]:
+        """Turns to send VERBATIM: everything not yet folded into the summary.
+        The cursor only advances over old FINALIZED turns, so recent partials
+        (large ts) are always included — pass the full snapshot here."""
+        return [t for t in turns if t.ts > self._folded_up_to_ts]
 
-    def should_update(self, finalized_turns: Sequence[Turn], keep_last: int, batch_size: int) -> bool:
-        """True once at least `batch_size` turns are waiting to be folded in —
-        batches the (paid) summarization call instead of firing on every turn."""
-        return len(self.pending_turns(finalized_turns, keep_last)) >= batch_size
+    def turns_to_fold(
+        self, finalized_turns: Sequence[Turn], budget_tokens: int, min_verbatim: int
+    ) -> list[Turn]:
+        """
+        The oldest not-yet-folded finalized turns to compress NOW so the
+        verbatim remainder fits `budget_tokens`, while always leaving at least
+        `min_verbatim` recent turns verbatim. Empty list = under budget, do
+        nothing (the common case).
+        """
+        unfolded = [t for t in finalized_turns if t.ts > self._folded_up_to_ts]
+        remaining = list(unfolded)
+        to_fold: list[Turn] = []
+        while len(remaining) > min_verbatim and _est_tokens(remaining) > budget_tokens:
+            to_fold.append(remaining.pop(0))
+        return to_fold
 
-    def apply_update(self, new_turns: Sequence[Turn], updated_summary: str) -> None:
+    def should_update(
+        self, finalized_turns: Sequence[Turn], budget_tokens: int, min_verbatim: int
+    ) -> bool:
+        """True when the verbatim transcript is over budget and there are old
+        turns that can be folded to bring it back down."""
+        return bool(self.turns_to_fold(finalized_turns, budget_tokens, min_verbatim))
+
+    def apply_update(self, folded_turns: Sequence[Turn], updated_summary: str) -> None:
         """Call after a successful summarize() call — commits the new summary
-        text and advances the fold cursor past `new_turns`."""
+        text and advances the fold cursor past `folded_turns` (so they drop out
+        of the verbatim set exactly as they enter the summary — no gap)."""
         self.summary = updated_summary.strip()
-        if new_turns:
-            self._folded_up_to_ts = max(t.ts for t in new_turns)
+        if folded_turns:
+            self._folded_up_to_ts = max(t.ts for t in folded_turns)
 
     def reset(self) -> None:
         """New interview session — clear all state."""

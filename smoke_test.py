@@ -318,60 +318,75 @@ def _turns(n: int, start_ts: float = 1.0) -> list[Turn]:
     return out
 
 
-def test_context_summary_no_pending_within_window() -> None:
+def test_context_summary_under_budget_folds_nothing() -> None:
     cs = ContextSummarizer()
     turns = _turns(5)
-    assert cs.pending_turns(turns, keep_last=8) == []
-    assert cs.should_update(turns, keep_last=8, batch_size=6) is False
+    # Whole transcript fits the budget → nothing folded, everything verbatim.
+    assert cs.turns_to_fold(turns, budget_tokens=10_000, min_verbatim=12) == []
+    assert cs.should_update(turns, 10_000, 12) is False
+    assert [t.text for t in cs.unfolded(turns)] == [t.text for t in turns]
 
 
-def test_context_summary_pending_only_turns_older_than_window() -> None:
+def test_context_summary_folds_oldest_over_budget() -> None:
     cs = ContextSummarizer()
-    turns = _turns(12)  # 4 older than an 8-turn window
-    pending = cs.pending_turns(turns, keep_last=8)
-    assert [t.text for t in pending] == ["turn 0", "turn 1", "turn 2", "turn 3"]
+    turns = _turns(20)
+    # budget=0 forces folding down to the min-verbatim floor: 20 - 12 = 8 oldest.
+    to_fold = cs.turns_to_fold(turns, budget_tokens=0, min_verbatim=12)
+    assert [t.text for t in to_fold] == [f"turn {i}" for i in range(8)]
+    assert cs.should_update(turns, 0, 12) is True
 
 
-def test_context_summary_should_update_respects_batch_size() -> None:
+def test_context_summary_never_folds_below_min_verbatim() -> None:
     cs = ContextSummarizer()
-    turns = _turns(12)  # 4 aged out
-    assert cs.should_update(turns, keep_last=8, batch_size=6) is False
-    turns = _turns(14)  # 6 aged out
-    assert cs.should_update(turns, keep_last=8, batch_size=6) is True
+    turns = _turns(14)
+    # Even wildly over budget, keep >= min_verbatim recent turns verbatim.
+    to_fold = cs.turns_to_fold(turns, budget_tokens=0, min_verbatim=12)
+    assert len(to_fold) == 2                       # 14 - 12
+    # With only min_verbatim turns, nothing is foldable.
+    assert cs.turns_to_fold(_turns(12), budget_tokens=0, min_verbatim=12) == []
+
+
+def test_context_summary_respects_token_budget() -> None:
+    cs = ContextSummarizer()
+    # 10 turns of 40 chars each = 400 chars => 100 est-tokens total.
+    turns = [Turn(speaker="candidate", text="x" * 40, ts=1.0 + i) for i in range(10)]
+    # budget 50 tokens (=200 chars => 5 turns), min_verbatim small so budget binds.
+    to_fold = cs.turns_to_fold(turns, budget_tokens=50, min_verbatim=2)
+    assert len(to_fold) == 5                       # keep 5 (=50 tokens) verbatim
 
 
 def test_context_summary_apply_update_advances_cursor() -> None:
     cs = ContextSummarizer()
-    turns = _turns(14)
-    pending = cs.pending_turns(turns, keep_last=8)
-    assert len(pending) == 6
-    cs.apply_update(pending, "The candidate discussed X and Y.")
+    turns = _turns(20)
+    to_fold = cs.turns_to_fold(turns, budget_tokens=0, min_verbatim=12)
+    cs.apply_update(to_fold, "The candidate discussed X and Y.")
     assert cs.summary == "The candidate discussed X and Y."
-    # Those 6 turns are folded now — same snapshot yields nothing new.
-    assert cs.pending_turns(turns, keep_last=8) == []
+    # Folded turns drop out of the verbatim set exactly as they enter the summary.
+    assert [t.text for t in cs.unfolded(turns)] == [f"turn {i}" for i in range(8, 20)]
+    # Only the min-verbatim floor remains → nothing more to fold.
+    assert cs.turns_to_fold(turns, budget_tokens=0, min_verbatim=12) == []
 
 
-def test_context_summary_folded_turns_survive_growth_and_dont_repeat() -> None:
+def test_context_summary_folded_turns_dont_repeat_on_growth() -> None:
     cs = ContextSummarizer()
-    turns = _turns(14)
-    first_batch = cs.pending_turns(turns, keep_last=8)
-    cs.apply_update(first_batch, "summary so far")
-
-    # More turns arrive; only the newly-aged-out ones should be pending —
-    # the already-folded ones must not reappear even though list indices shift.
-    grown = _turns(20)
-    pending = cs.pending_turns(grown, keep_last=8)
-    assert [t.text for t in pending] == ["turn 6", "turn 7", "turn 8", "turn 9", "turn 10", "turn 11"]
+    turns = _turns(20)
+    cs.apply_update(cs.turns_to_fold(turns, 0, 12), "summary so far")
+    # More turns arrive; already-folded turns must not reappear as verbatim.
+    grown = _turns(30)
+    assert [t.text for t in cs.unfolded(grown)] == [f"turn {i}" for i in range(8, 30)]
+    # And the next fold takes the oldest of the NEW unfolded set, never re-folds.
+    again = cs.turns_to_fold(grown, 0, 12)
+    assert again[0].text == "turn 8"
 
 
 def test_context_summary_reset_clears_state() -> None:
     cs = ContextSummarizer()
-    turns = _turns(14)
-    cs.apply_update(cs.pending_turns(turns, keep_last=8), "summary")
+    turns = _turns(20)
+    cs.apply_update(cs.turns_to_fold(turns, 0, 12), "summary")
     cs.reset()
     assert cs.summary == ""
-    assert cs.pending_turns(turns, keep_last=8) == cs.pending_turns(turns, keep_last=8)
-    assert len(cs.pending_turns(turns, keep_last=8)) == 6
+    # Cursor reset → the whole transcript is verbatim again.
+    assert [t.text for t in cs.unfolded(turns)] == [t.text for t in turns]
 
 
 def main() -> int:

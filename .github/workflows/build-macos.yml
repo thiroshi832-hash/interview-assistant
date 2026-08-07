@@ -8,10 +8,7 @@ jobs:
     runs-on: macos-14  # Apple Silicon runner (M1), macOS 14
 
     env:
-      # Target macOS 11 so the built app runs on Big Sur and later.
-      # _PYTHON_HOST_PLATFORM makes pip prefer macOS 11-compatible wheels.
       MACOSX_DEPLOYMENT_TARGET: "11.0"
-      _PYTHON_HOST_PLATFORM: "macosx-11.0-arm64"
 
     steps:
       - uses: actions/checkout@v4
@@ -26,11 +23,36 @@ jobs:
           brew install portaudio
           brew install gcc
 
-      - name: Install Python dependencies
+      - name: Download macOS 11-compatible binary wheels
         run: |
-          pip install -r requirements_macos.txt
-          pip install pyinstaller
-          pip install --no-deps resemblyzer
+          mkdir -p wheels
+          # pip on macOS 14 defaults to macOS 14/15 platform tags.
+          # Force download of macOS 11 ARM64/universal2 wheels for packages
+          # whose binary wheels contain native code (dylibs) that would
+          # crash on macOS 11 if built against a newer SDK.
+          PLATFORM_ARGS="--platform macosx_11_0_arm64 --platform macosx_11_0_universal2 --python-version 3.12 --only-binary :all: --no-deps -d ./wheels"
+          for pkg in \
+            "PySide6>=6.5,<6.6" \
+            "PySide6-Essentials>=6.5,<6.6" \
+            "PySide6-Addons>=6.5,<6.6" \
+            "shiboken6>=6.5,<6.6" \
+            "numpy>=1.26,<2" \
+            "scipy>=1.11,<1.14" \
+            "onnxruntime>=1.16" \
+          ; do
+            echo "--- Downloading: $pkg ---"
+            pip download $PLATFORM_ARGS "$pkg" || echo "WARN: no macOS 11 wheel for $pkg, will install normally"
+          done
+          ls -la wheels/
+
+      - name: Install dependencies
+        run: |
+          # Install from macOS 11 wheels first; packages not in ./wheels
+          # are fetched normally (pure-Python or source build with
+          # MACOSX_DEPLOYMENT_TARGET=11.0).
+          pip install --find-links ./wheels -r requirements_macos.txt
+          pip install --find-links ./wheels pyinstaller
+          pip install --find-links ./wheels --no-deps resemblyzer
 
       - name: Verify imports
         run: python -c "import PySide6, scipy, numpy, pyaudio, anthropic; print('All deps OK')"

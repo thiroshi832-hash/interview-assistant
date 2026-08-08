@@ -13,10 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install system dependencies
         run: |
@@ -30,7 +30,7 @@ jobs:
           # Force download of macOS 11 ARM64/universal2 wheels for packages
           # whose binary wheels contain native code (dylibs) that would
           # crash on macOS 11 if built against a newer SDK.
-          PLATFORM_ARGS="--platform macosx_11_0_arm64 --platform macosx_11_0_universal2 --python-version 3.12 --only-binary :all: --no-deps -d ./wheels"
+          PLATFORM_ARGS="--platform macosx_11_0_arm64 --platform macosx_11_0_universal2 --python-version 3.11 --only-binary :all: --no-deps -d ./wheels"
           for pkg in \
             "PySide6>=6.5,<6.6" \
             "PySide6-Essentials>=6.5,<6.6" \

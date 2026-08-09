@@ -6,7 +6,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QVBoxLayout,
+    QWidget,
 )
 
 from config import Config
@@ -28,9 +29,19 @@ class SetupView(QWidget):
         self.cfg = cfg
         self._resume_text: str = ""
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(20, 20, 20, 20)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        inner = QWidget()
+        outer = QVBoxLayout(inner)
+        outer.setContentsMargins(20, 20, 20, 10)
         outer.setSpacing(14)
+        scroll.setWidget(inner)
+        root.addWidget(scroll, stretch=1)
 
         # ── trial / license status (only shown while on a trial) ──
         if not (cfg.license_key and is_valid_license(cfg.license_key)):
@@ -149,12 +160,16 @@ class SetupView(QWidget):
         personal_layout.addWidget(self.in_personal)
         outer.addWidget(personal_box)
 
-        # ── start ──
+        # ── start (fixed at bottom, outside scroll area) ──
+        btn_container = QWidget()
+        btn_layout = QVBoxLayout(btn_container)
+        btn_layout.setContentsMargins(20, 10, 20, 20)
         self.btn_start = QPushButton("Start interview")
         self.btn_start.setObjectName("primary")
         self.btn_start.setMinimumHeight(40)
         self.btn_start.clicked.connect(self._start)
-        outer.addWidget(self.btn_start)
+        btn_layout.addWidget(self.btn_start)
+        root.addWidget(btn_container)
 
     def _load_resume(self):
         # Start the file picker in the directory of the last-loaded resume

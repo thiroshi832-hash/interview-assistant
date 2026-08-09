@@ -22,6 +22,7 @@ jobs:
         run: |
           brew install portaudio
           brew install gcc
+          brew install openblas
 
       - name: Download macOS 11-compatible binary wheels
         run: |
@@ -46,11 +47,13 @@ jobs:
           ls -la wheels/
 
       - name: Install dependencies
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/openblas/lib/pkgconfig
         run: |
-          # Install from macOS 11 wheels first; packages not in ./wheels
-          # are fetched normally (pure-Python or source build with
-          # MACOSX_DEPLOYMENT_TARGET=11.0).
-          pip install --find-links ./wheels -r requirements_macos.txt
+          # scipy has no macOS 11 ARM64 wheels on PyPI — all are macOS 12+.
+          # Build it from source so MACOSX_DEPLOYMENT_TARGET=11.0 applies.
+          # scikit-learn is similar, so build from source too.
+          pip install --find-links ./wheels --no-binary scipy,scikit-learn -r requirements_macos.txt
           pip install --find-links ./wheels pyinstaller
           pip install --find-links ./wheels --no-deps resemblyzer
 

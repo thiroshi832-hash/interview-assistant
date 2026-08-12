@@ -231,6 +231,14 @@ class SenderTrayApp(QObject):
         self.action_clients.setEnabled(False)
         self.menu.addAction(self.action_clients)
 
+        # Permanent row. action_status is a single rolling line that client
+        # connect/disconnect events overwrite within seconds, so "mic only"
+        # has to live somewhere it can still be read later — it's the first
+        # thing to check when the helper laptop gets audio but no transcript.
+        self.action_audio_mode = QAction("Audio: idle", self.menu)
+        self.action_audio_mode.setEnabled(False)
+        self.menu.addAction(self.action_audio_mode)
+
         self.menu.addSeparator()
 
         self.action_toggle = QAction("Start streaming", self.menu)
@@ -291,6 +299,7 @@ class SenderTrayApp(QObject):
         self._running = True
         self.action_toggle.setText("Stop streaming")
         self.action_settings.setEnabled(False)
+        self._refresh_audio_mode()
         self.tray.setToolTip(f"AetherStack Sender — streaming on port {self.cfg['port']}")
         self.tray.showMessage(
             "AetherStack Sender",
@@ -305,7 +314,19 @@ class SenderTrayApp(QObject):
         self._running = False
         self.action_toggle.setText("Start streaming")
         self.action_settings.setEnabled(True)
+        self._refresh_audio_mode()
         self.tray.setToolTip("AetherStack Sender — idle")
+
+    def _refresh_audio_mode(self) -> None:
+        mode = getattr(self.streamer, "audio_mode", "idle")
+        if mode == "mic+system":
+            self.action_audio_mode.setText("Audio: mic + system audio ✓")
+        elif mode == "mic-only":
+            self.action_audio_mode.setText(
+                "Audio: MIC ONLY — interviewer NOT captured"
+            )
+        else:
+            self.action_audio_mode.setText("Audio: idle")
 
     def _open_settings(self) -> None:
         if self._running:

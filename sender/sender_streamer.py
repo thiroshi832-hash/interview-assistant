@@ -79,6 +79,12 @@ class SenderStreamer:
         # tell a real startup from one that died on a bad port / missing mic.
         self._serving = False
         self._last_error: Optional[str] = None
+        # Which streams we ended up capturing. The UI shows this permanently:
+        # on_status is a single rolling line, so a "mic only" warning there is
+        # immediately overwritten by the first client connect/disconnect and
+        # the user can never find out what they're actually streaming.
+        self.audio_mode: str = "idle"          # idle | mic+system | mic-only
+        self.loopback_warning: Optional[str] = None
 
     # ── public API ───────────────────────────────────────────────────────
     def start(self, port: int, mic_idx: Optional[int], loopback_idx: Optional[int]) -> None:
@@ -156,6 +162,7 @@ class SenderStreamer:
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=2.0)
         self._cap_threads = []
+        self.audio_mode = "idle"
         self.on_client_count(0)
         self.on_status("Stopped.")
 
@@ -206,8 +213,12 @@ class SenderStreamer:
             if warning:
                 # Mic-only mode: keep serving so the helper laptop can still
                 # connect and hear the candidate.
+                self.audio_mode = "mic-only"
+                self.loopback_warning = warning
                 self.on_status(f"Listening on port {self._port} — MIC ONLY. {warning}")
             else:
+                self.audio_mode = "mic+system"
+                self.loopback_warning = None
                 self.on_status(
                     f"Listening on 0.0.0.0:{self._port} — share this port with the helper laptop."
                 )

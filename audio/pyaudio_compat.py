@@ -46,10 +46,17 @@ def get_loopback_devices(pa: pyaudio.PyAudio) -> list[dict[str, Any]]:
     return devices
 
 
+# Input devices whose name contains one of these is a virtual audio device
+# carrying system output — the macOS stand-in for WASAPI loopback.
+_VIRTUAL_DEVICE_HINTS = (
+    "blackhole", "soundflower", "loopback audio", "vb-cable", "multi-output",
+)
+
+
 def get_default_loopback(pa: pyaudio.PyAudio) -> dict[str, Any] | None:
     """Return the default loopback device. On Windows, uses the WASAPI default
-    loopback. On macOS, returns None (user must explicitly pick their virtual
-    audio device in Settings)."""
+    loopback. On macOS, auto-detects an installed virtual audio device
+    (BlackHole, Soundflower, …); returns None if none is installed."""
     if IS_WINDOWS:
         try:
             return pa.get_default_wasapi_loopback()  # type: ignore[attr-defined]
@@ -64,7 +71,12 @@ def get_default_loopback(pa: pyaudio.PyAudio) -> dict[str, Any] | None:
         except Exception:
             pass
         return None
-    # macOS: no automatic loopback — user must configure a virtual audio device.
+    # macOS: no WASAPI equivalent. Pick a virtual audio device by name if the
+    # user installed one, so the common BlackHole setup works out of the box.
+    for info in get_loopback_devices(pa):
+        name = str(info.get("name", "")).lower()
+        if any(hint in name for hint in _VIRTUAL_DEVICE_HINTS):
+            return info
     return None
 
 

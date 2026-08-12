@@ -75,6 +75,10 @@ class SenderStreamer:
         self._server = None
         self._stop_evt = threading.Event()
         self._last_level_emit: dict[str, float] = {"mic": 0.0, "loopback": 0.0}
+        # Set once the server is actually accepting clients, so `start()` can
+        # tell a real startup from one that died on a bad port / missing mic.
+        self._serving = False
+        self._last_error: Optional[str] = None
 
     # ── public API ───────────────────────────────────────────────────────
     def start(self, port: int, mic_idx: Optional[int], loopback_idx: Optional[int]) -> None:
@@ -85,6 +89,8 @@ class SenderStreamer:
         self._loop_idx = loopback_idx
         self._stop_evt.clear()
         self._running = True
+        self._serving = False
+        self._last_error = None
 
         # asyncio loop in a worker thread
         ready = threading.Event()
@@ -109,6 +115,15 @@ class SenderStreamer:
         # Block briefly so the audio threads only start once the WS server
         # is listening — otherwise the first ~second of frames vanishes.
         ready.wait(timeout=5.0)
+
+        if not self._serving:
+            # Startup died (port in use, no mic, …). Tear down and report so
+            # the tray stays idle — otherwise Settings is greyed out and the
+            # user can't fix the device that caused the failure.
+            err = self._last_error or "Sender failed to start."
+            self.stop()
+            self.on_status(err)
+            raise RuntimeError(err)
 
     def stop(self) -> None:
         if not self._running:
@@ -171,30 +186,45 @@ class SenderStreamer:
                 max_size=None, ping_interval=20, ping_timeout=15,
             )
         except Exception as e:
-            self.on_status(f"Could not bind port {self._port}: {e}")
+            self._last_error = f"Could not bind port {self._port}: {e}"
+            self.on_status(self._last_error)
             ready.set()
             return
 
-        # Now start audio capture (so we don't drop the first frames).
+        # Everything past the bind goes through this finally so the listening
+        # socket is always released — otherwise a failed start leaves the port
+        # bound and the next attempt dies with EADDRINUSE.
         try:
-            self._start_audio()
-        except Exception as e:
-            self.on_status(f"Audio start failed: {e}")
+            # Now start audio capture (so we don't drop the first frames).
+            try:
+                warning = self._start_audio()
+            except Exception as e:
+                self._last_error = f"Audio start failed: {e}"
+                self.on_status(self._last_error)
+                return
+
+            if warning:
+                # Mic-only mode: keep serving so the helper laptop can still
+                # connect and hear the candidate.
+                self.on_status(f"Listening on port {self._port} — MIC ONLY. {warning}")
+            else:
+                self.on_status(
+                    f"Listening on 0.0.0.0:{self._port} — share this port with the helper laptop."
+                )
+            self._serving = True
             ready.set()
-            return
 
-        self.on_status(f"Listening on 0.0.0.0:{self._port} — share this port with the helper laptop.")
-        ready.set()
-
-        # Drain the broadcast queue forever.
-        try:
+            # Drain the broadcast queue forever.
             await self._broadcast_loop()
         finally:
+            self._serving = False
+            ready.set()  # no-op unless we bailed out before the line above
             try:
                 self._server.close()
                 await self._server.wait_closed()
             except Exception:
                 pass
+            self._server = None
 
     async def _broadcast_loop(self) -> None:
         assert self._broadcast_queue is not None
@@ -218,7 +248,14 @@ class SenderStreamer:
                 self.on_client_count(len(self._clients))
 
     # ── audio capture ────────────────────────────────────────────────────
-    def _start_audio(self) -> None:
+    def _start_audio(self) -> Optional[str]:
+        """Open the capture streams.
+
+        Returns a warning message if the loopback stream could not be opened
+        (mic-only mode), else None. A missing loopback is not fatal: macOS has
+        no built-in loopback, so without a virtual audio device we still stream
+        the candidate's mic rather than leaving the sender dead.
+        """
         self._pa = pyaudio.PyAudio()
 
         # Mic stream → tag 0x01 (candidate)
@@ -242,10 +279,10 @@ class SenderStreamer:
         t_mic.start()
         self._cap_threads.append(t_mic)
 
-        # Loopback stream → tag 0x02 (interviewer)
+        # Loopback stream → tag 0x02 (interviewer). Optional — see docstring.
         loopback = self._get_loopback_device(self._loop_idx)
         if loopback is None:
-            raise RuntimeError(no_loopback_error())
+            return no_loopback_error()
         loop_rate = int(loopback["defaultSampleRate"])
         loop_channels = int(loopback["maxInputChannels"]) or 2
         self._loop_stream = self._pa.open(
@@ -264,6 +301,7 @@ class SenderStreamer:
         )
         t_loop.start()
         self._cap_threads.append(t_loop)
+        return None
 
     def _capture_reader(self, stream, rate: int, channels: int, fmt: str,
                         tag: int, side: str) -> None:

@@ -39,7 +39,7 @@ jobs:
             "shiboken6>=6.5,<6.6" \
             "numpy>=1.26,<2" \
             "scipy>=1.11,<1.14" \
-            "onnxruntime>=1.16" \
+            "onnxruntime>=1.17,<1.20" \
           ; do
             echo "--- Downloading: $pkg ---"
             pip download $PLATFORM_ARGS "$pkg" || echo "WARN: no macOS 11 wheel for $pkg, will install normally"
@@ -50,15 +50,29 @@ jobs:
         env:
           PKG_CONFIG_PATH: /opt/homebrew/opt/openblas/lib/pkgconfig
         run: |
-          # scipy has no macOS 11 ARM64 wheels on PyPI — all are macOS 12+.
-          # Build it from source so MACOSX_DEPLOYMENT_TARGET=11.0 applies.
-          # scikit-learn is similar, so build from source too.
+          # Install the pre-downloaded macOS 11 wheels FIRST, with --no-index.
+          # --find-links on its own only *adds* candidates — pip stays free to
+          # resolve a newer release from PyPI, which is exactly how
+          # onnxruntime 1.28 (macOS 14 SDK) got in and crashed Big Sur with
+          # "Symbol not found: ...pmr25monotonic_buffer_resource...".
+          pip install --no-index --no-deps --find-links ./wheels \
+            PySide6 PySide6-Essentials PySide6-Addons shiboken6 \
+            numpy onnxruntime
+
+          # Everything else. scipy/scikit-learn have no genuine macOS 11
+          # wheels (the macosx_11_0 tag is a lie — the binaries are built
+          # against a newer SDK), so build them from source against
+          # MACOSX_DEPLOYMENT_TARGET=11.0.
           pip install --find-links ./wheels --no-binary scipy,scikit-learn -r requirements_macos.txt
           pip install --find-links ./wheels pyinstaller
           pip install --find-links ./wheels --no-deps resemblyzer
 
       - name: Verify imports
-        run: python -c "import PySide6, scipy, numpy, pyaudio, anthropic; print('All deps OK')"
+        run: |
+          # --no-deps above can leave transitive deps missing; surface that here.
+          pip check
+          python -c "import PySide6, scipy, numpy, pyaudio, anthropic, onnxruntime; print('All deps OK')"
+          python -c "import onnxruntime, PySide6; print('onnxruntime', onnxruntime.__version__); print('PySide6', PySide6.__version__)"
 
       - name: Generate .icns icon
         run: python scripts/make_icns.py
@@ -86,3 +100,10 @@ jobs:
         with:
           name: AetherStack-Sender-macOS
           path: AetherStack-Sender-macOS.zip
+
+      # Runs after the uploads so a failure still leaves testable artifacts.
+      # Reads LC_BUILD_VERSION out of every bundled Mach-O — the wheel's
+      # platform tag can't be trusted, and a mismatch otherwise only shows up
+      # as a dyld crash on the user's machine.
+      - name: Verify every bundled binary runs on macOS 11
+        run: python scripts/check_macos_min_version.py dist --max-version 11.0

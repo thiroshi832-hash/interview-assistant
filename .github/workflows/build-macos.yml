@@ -69,8 +69,18 @@ jobs:
 
       - name: Verify imports
         run: |
-          # --no-deps above can leave transitive deps missing; surface that here.
-          pip check
+          # The --no-deps installs above can leave transitive deps missing, so
+          # surface that here. resemblyzer is deliberately installed without
+          # its deps (torch/webrtcvad are unused and don't build on macOS 11),
+          # so ignore those; anything else is a real problem.
+          problems="$(pip check | grep -v '^resemblyzer ' || true)"
+          if [ -n "$problems" ]; then
+            echo "Unexpected dependency problems:"
+            echo "$problems"
+            exit 1
+          fi
+          echo "pip check OK (resemblyzer's intentional omissions ignored)"
+
           python -c "import PySide6, scipy, numpy, pyaudio, anthropic, onnxruntime; print('All deps OK')"
           python -c "import onnxruntime, PySide6; print('onnxruntime', onnxruntime.__version__); print('PySide6', PySide6.__version__)"
 

@@ -108,7 +108,6 @@ class SttSettingsDialog(QDialog):
         self.cb_device.addItem(gpu_label, userData="cuda")
         if not self._cuda:
             # disable the GPU option
-            from PySide6.QtCore import QSize
             model = self.cb_device.model()
             item = model.item(1)
             if item is not None:

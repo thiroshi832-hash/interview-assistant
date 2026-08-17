@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -169,13 +168,18 @@ def effective_stt_engine(cfg: Config) -> str:
     return "whispercpp"
 
 
-def make_stt_backend(cfg: Config) -> STTBackend:
-    if effective_stt_engine(cfg) == "deepgram":
+def make_stt_backend(cfg: Config, *, engine: Optional[str] = None) -> STTBackend:
+    """Build the STT backend. `engine` forces a specific engine (used by the
+    start-time fallback) WITHOUT touching cfg.stt_engine; when None, the engine
+    is resolved from config via effective_stt_engine()."""
+    eng = engine or effective_stt_engine(cfg)
+    if eng == "deepgram":
         from pipeline.deepgram_stt import DeepgramBackend
         return DeepgramBackend(cfg)
-    # Auto-migrate any existing "batch" config to whispercpp (faster-whisper
-    # was removed in the slim-down; whisper.cpp covers the same use case).
-    if (cfg.stt_engine or "").lower() == "batch":
+    # Auto-migrate a persisted legacy "batch" config to whispercpp (faster-whisper
+    # was removed in the slim-down). Only on the config-driven path — never when
+    # an explicit engine override is passed.
+    if engine is None and (cfg.stt_engine or "").lower() == "batch":
         cfg.stt_engine = "whispercpp"
         cfg.save()
     return WhisperCppBackend(cfg)

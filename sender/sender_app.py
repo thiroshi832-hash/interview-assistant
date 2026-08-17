@@ -37,7 +37,6 @@ from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QVBoxLayout,
-    QWidget,
 )
 
 # When running from source, `sender_app.py` is invoked as a script; relative

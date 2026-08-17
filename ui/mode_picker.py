@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QLabel, QPushButton, QRadioButton, QVBoxLayout, QWidget,
+    QDialog, QLabel, QPushButton, QRadioButton, QVBoxLayout,
 )
 
 from ui.style import STYLE

@@ -1,7 +1,6 @@
 """First-launch dialog: pick provider and paste its API key. Saved to disk."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup, QDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QRadioButton, QVBoxLayout,

@@ -43,7 +43,7 @@ from pipeline.question_detector import QuestionDetector
 from pipeline.stt_backend import STTEvent
 from pipeline.stt_engines import make_stt_backend, effective_stt_engine
 from pipeline.transcript import Transcript
-from pipeline.vad import Segmenter, Utterance
+from pipeline.vad import Segmenter
 from paths import icon_path
 from pipeline.license import is_valid_license, trial_expired
 from ui.evaluation_dialog import EvaluationDialog
@@ -192,10 +192,6 @@ class App(QObject):
         # Subscribe to transcript updates so we emit `turn_update` whenever
         # the transcript changes (partial or final, replaced or new).
         self.transcript.subscribe(self._on_transcript_change)
-        # Diarize-tag watchdog state — used to warn the user if Deepgram
-        # diarization is on but never producing per-word speaker IDs.
-        self._finals_seen_without_diarize: int = 0
-        self._diarize_warning_emitted: bool = False
         # Helper-acoustic anchor mode: running voice-similarity-to-anchor per
         # Deepgram speaker tag. The tag closest to the enrolled recording is
         # the candidate (relative comparison — see _resolve_by_voice).
@@ -234,26 +230,29 @@ class App(QObject):
                 f"Loading STT ({effective_stt_engine(self.cfg)} / {self.cfg.whisper_model}) — this can take a few seconds…"
             )
 
-        # Start the STT backend. If the configured engine fails (e.g. Deepgram
-        # without internet, missing API key), fall back to whisper.cpp →
-        # faster-whisper batch in order.
+        # Start the STT backend. If the configured engine fails at start time
+        # (e.g. Deepgram with a key but no internet), fall back to on-device
+        # whisper.cpp. This is a RUNTIME-only override — we do NOT mutate
+        # cfg.stt_engine (a later cfg.save() would persist it and silently
+        # downgrade the saved default). whisper.cpp also needs local VAD
+        # segmentation (Deepgram did its own), so rebuild the segmenter without
+        # pass-through — the segmenter hasn't been started yet at this point.
         try:
             self.stt.start(on_event=self._on_stt_event)
         except Exception as e:
-            original = self.cfg.stt_engine
-            self.status.emit(f"STT engine '{original}' failed ({e}); falling back…")
-            for fallback in ("whispercpp", "batch"):
-                if fallback == original:
-                    continue
-                try:
-                    self.cfg.stt_engine = fallback
-                    self.stt = make_stt_backend(self.cfg)
-                    self.stt.start(on_event=self._on_stt_event)
-                    self.status.emit(f"Now using STT engine: {fallback}")
-                    break
-                except Exception:
-                    continue
-            else:
+            self.status.emit(f"STT engine failed to start ({e}); falling back to on-device whisper.cpp…")
+            try:
+                self.stt = make_stt_backend(self.cfg, engine="whispercpp")
+                self.segmenter = Segmenter(
+                    self.source, self.cfg,
+                    on_chunk=self._on_speech_chunk,
+                    on_close=self._on_speech_close,
+                    on_level=lambda lvl: self.mic_level.emit(lvl),
+                    pass_through=False,
+                )
+                self.stt.start(on_event=self._on_stt_event)
+                self.status.emit("Now using on-device STT (whisper.cpp).")
+            except Exception:
                 self.status.emit("All STT engines failed to start.")
                 raise
 
@@ -362,30 +361,17 @@ class App(QObject):
 
     def swap_speakers(self) -> None:
         """
-        User-triggered: invert candidate/interviewer labels and lock them.
-        Same-laptop mode (known speakers per stream): just flips the static
-        mapping for new utterances. Helper mode: tells the auto-labeler to
-        invert + lock so it never re-flips by itself, AND flips the
-        Deepgram-diarize-tag map.
-
-        After a manual swap, the mapping is also LOCKED — future anchor
-        re-evaluations on short clips won't overwrite the user's choice.
+        User-triggered: invert candidate/interviewer labels.
+        Helper mode WITHOUT enrollment uses the behavioural AutoLabeler → tell
+        it to invert + lock so it never re-flips by itself. Every other mode
+        (channel-tagged streams, or helper mode WITH an enrolled anchor) is
+        labelled per-utterance, so a persistent boolean flip covers them.
         """
         if self.auto_labeler is not None:
             self.auto_labeler.swap_and_lock()
-        # If Deepgram diarization is producing tags, invert their mapping too.
-        dg_map = getattr(self, "_dg_speaker_map", None)
-        if dg_map:
-            self._dg_speaker_map = {
-                tag: ("candidate" if label == "interviewer" else "interviewer")
-                for tag, label in dg_map.items()
-            }
-            # User has spoken — their decision is now authoritative.
-            self._dg_map_user_locked = True
-        # Same-laptop swap toggle stays for the case with no diarizer / no map.
-        if self.auto_labeler is None and not dg_map:
+        else:
             self._same_laptop_swap = not getattr(self, "_same_laptop_swap", False)
-        self.status.emit("Labels swapped — future turns use the new mapping (locked).")
+        self.status.emit("Labels swapped — future turns use the new mapping.")
 
     # ── audio → text path ────────────────────────────────────────────────
     def _on_speech_chunk(self, speaker: Optional[str], pcm: bytes, ts: float) -> None:

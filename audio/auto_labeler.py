@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import threading
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 _QUESTION_LIKE = re.compile(

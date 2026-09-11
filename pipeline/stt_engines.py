@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -62,14 +61,17 @@ class WhisperCppBackend(STTBackend):
     def _ensure_model(self):
         if self._model is None:
             from pywhispercpp.model import Model  # type: ignore
-            # pywhispercpp later calls `.write()` on `redirect_whispercpp_logs_to`
-            # — `False` and `None` both break. Give it a real discarding buffer.
-            import io as _io
+            # `None` -> pywhispercpp redirects to a real os.devnull file (has
+            # a valid OS file descriptor). Passing an in-memory io.StringIO()
+            # crashes on current pywhispercpp: it checks hasattr(stream,
+            # "fileno") to decide whether to do an OS-level fd dup2 onto the
+            # stream, and StringIO has that method (inherited from IOBase) —
+            # it just raises io.UnsupportedOperation when actually called.
             self._model = Model(
                 self.cfg.whisper_model,
                 print_realtime=False,
                 print_progress=False,
-                redirect_whispercpp_logs_to=_io.StringIO(),
+                redirect_whispercpp_logs_to=None,
             )
 
     def start(self, on_event):
@@ -148,14 +150,36 @@ class WhisperCppBackend(STTBackend):
 # ── Factory ──────────────────────────────────────────────────────────────────
 
 
-def make_stt_backend(cfg: Config) -> STTBackend:
-    engine = (cfg.stt_engine or "whispercpp").lower()
+def effective_stt_engine(cfg: Config) -> str:
+    """The engine that will ACTUALLY run this session — "deepgram" or "whispercpp".
+
+    Deepgram needs an API key + internet. Without a key we transparently fall
+    back to on-device whisper.cpp, so a fresh (keyless) install still works
+    instead of crashing when DeepgramBackend.__init__ raises. Resolved WITHOUT
+    mutating cfg.stt_engine, so the user's "deepgram" default stays on disk and
+    takes effect the moment they add a key. Use this (not the raw cfg field)
+    anywhere behaviour branches on the engine.
+    """
+    engine = (cfg.stt_engine or "deepgram").lower()
+    if engine == "batch":                       # legacy faster-whisper — removed
+        engine = "whispercpp"
     if engine in ("deepgram", "cloud"):
+        return "deepgram" if cfg.deepgram_api_key else "whispercpp"
+    return "whispercpp"
+
+
+def make_stt_backend(cfg: Config, *, engine: Optional[str] = None) -> STTBackend:
+    """Build the STT backend. `engine` forces a specific engine (used by the
+    start-time fallback) WITHOUT touching cfg.stt_engine; when None, the engine
+    is resolved from config via effective_stt_engine()."""
+    eng = engine or effective_stt_engine(cfg)
+    if eng == "deepgram":
         from pipeline.deepgram_stt import DeepgramBackend
         return DeepgramBackend(cfg)
-    # Auto-migrate any existing "batch" config to whispercpp (faster-whisper
-    # was removed in the slim-down; whisper.cpp covers the same use case).
-    if engine == "batch":
+    # Auto-migrate a persisted legacy "batch" config to whispercpp (faster-whisper
+    # was removed in the slim-down). Only on the config-driven path — never when
+    # an explicit engine override is passed.
+    if engine is None and (cfg.stt_engine or "").lower() == "batch":
         cfg.stt_engine = "whispercpp"
         cfg.save()
     return WhisperCppBackend(cfg)

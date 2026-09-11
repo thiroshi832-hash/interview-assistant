@@ -14,7 +14,10 @@ Write-Host "[2/3] Installing resemblyzer without its webrtcvad dep..." -Foregrou
 python -m pip install --disable-pip-version-check --no-deps resemblyzer
 
 Write-Host "[3/3] Verifying imports..." -ForegroundColor Cyan
-python -c "import resemblyzer, librosa, faster_whisper, silero_vad, pyaudiowpatch, anthropic, PySide6; print('All deps importable.')"
+# faster_whisper / silero_vad are NOT dependencies of the slim build (whisper.cpp
+# via pywhispercpp covers STT; VAD hits the bundled .onnx directly via onnxruntime)
+# — don't check for them here, they were intentionally dropped from requirements.txt.
+python -c "import resemblyzer, librosa, onnxruntime, pyaudiowpatch, anthropic, PySide6; print('All deps importable.')"
 
 Write-Host ""
 Write-Host "Done. Set ANTHROPIC_API_KEY then run:" -ForegroundColor Green

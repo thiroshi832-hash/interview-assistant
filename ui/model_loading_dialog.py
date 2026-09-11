@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import threading
 
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout,
 )
@@ -56,7 +56,8 @@ class ModelLoadingDialog(QDialog):
         # Decide if there's actually anything big enough to be worth showing a
         # progress dialog for. With LLM warmup, almost always yes — warmup is
         # a ~1-2 s network round-trip and the user wants visual feedback.
-        engine = (cfg.stt_engine or "batch").lower()
+        from pipeline.stt_engines import effective_stt_engine
+        engine = effective_stt_engine(cfg)
         is_cached = (
             engine == "deepgram"
             or (engine == "whispercpp" and whispercpp_is_cached(cfg.whisper_model))

@@ -35,9 +35,15 @@ class SingleMicSource(AudioSource):
         self._running = True
         self._pa = pyaudio.PyAudio()
 
-        mic_info = self._pa.get_default_input_device_info()
+        # Use the mic the user selected (Audio devices…), not just the Windows
+        # default — the default is often a virtual-audio device that carries
+        # system playback rather than the room mic that hears the candidate.
+        mic_info = self._get_input_device(self.cfg.mic_device_index)
         rate = int(mic_info["defaultSampleRate"])
-        channels = min(int(mic_info["maxInputChannels"]), 1) or 1
+        # Open at the device's NATIVE channel count and downmix to mono in
+        # software (to_mono_16k_int16 handles channels > 1). Forcing PortAudio
+        # to mono on a natively-stereo virtual device produces garbled audio.
+        channels = int(mic_info["maxInputChannels"]) or 1
         self._stream = self._pa.open(
             format=pyaudio.paInt16,
             channels=channels,
@@ -50,6 +56,18 @@ class SingleMicSource(AudioSource):
             target=self._reader, args=(self._stream, rate, channels), daemon=True
         )
         self._thread.start()
+
+    def _get_input_device(self, index: int | None):
+        """Configured input device, falling back to the system default mic."""
+        assert self._pa is not None
+        if index is not None:
+            try:
+                info = self._pa.get_device_info_by_index(int(index))
+                if int(info.get("maxInputChannels", 0) or 0) > 0:
+                    return info
+            except Exception:
+                pass
+        return self._pa.get_default_input_device_info()
 
     def stop(self) -> None:
         self._running = False

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QVBoxLayout,
@@ -15,6 +15,7 @@ from pipeline.license import days_remaining, is_valid_license
 from resume_loader import load_resume
 from ui.api_key_dialog import ApiKeyDialog
 from ui.audio_device_dialog import AudioDeviceDialog
+from ui.mode_picker import MODE_HELPER
 from ui.stt_settings_dialog import SttSettingsDialog
 from ui.voice_enroll_dialog import VoiceEnrollDialog
 
@@ -24,10 +25,12 @@ class SetupView(QWidget):
 
     ready = Signal(str, str, str, str)   # resume, job_title, job_description, personal_context
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, mode: str = ""):
         super().__init__()
         self.cfg = cfg
+        self.mode = mode
         self._resume_text: str = ""
+        self._resume_filename: str = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -119,18 +122,28 @@ class SetupView(QWidget):
 
         outer.addWidget(resume_box)
 
-        # Auto-load the previously used resume if the file still exists on
-        # disk. Any parse / IO failure is silent — user can just pick again.
-        self._autoload_saved_resume()
+        # Restore the resume from the last session so the user isn't forced
+        # to re-upload it every launch.
+        if cfg.resume_text:
+            self._resume_text = cfg.resume_text
+            self._resume_filename = cfg.resume_filename
+            self.txt_preview.setPlainText(cfg.resume_text)
+            self.lbl_status.setText(
+                f"Restored: {cfg.resume_filename or 'previous resume'}  ({len(cfg.resume_text)} chars)"
+            )
 
         # ── job ──
         job_box = QGroupBox("Role")
         form = QFormLayout(job_box)
         self.in_title = QLineEdit()
         self.in_title.setPlaceholderText("e.g. Senior Backend Engineer")
+        if cfg.job_title:
+            self.in_title.setText(cfg.job_title)
         self.in_jd = QPlainTextEdit()
         self.in_jd.setPlaceholderText("Paste the job description (optional but recommended).")
         self.in_jd.setMinimumHeight(120)
+        if cfg.job_description:
+            self.in_jd.setPlainText(cfg.job_description)
         form.addRow("Job title:", self.in_title)
         form.addRow("Description:", self.in_jd)
         outer.addWidget(job_box)
@@ -190,22 +203,11 @@ class SetupView(QWidget):
             QMessageBox.warning(self, "Could not load resume", str(e))
             return
         self._resume_text = text
+        self._resume_filename = Path(path).name
         self.txt_preview.setPlainText(text)
         self.lbl_status.setText(f"Loaded: {Path(path).name}  ({len(text)} chars)")
         self.cfg.resume_path = path
         self.cfg.save()
-
-    def _autoload_saved_resume(self) -> None:
-        path = self.cfg.resume_path
-        if not path or not Path(path).is_file():
-            return
-        try:
-            text = load_resume(path)
-        except Exception:
-            return
-        self._resume_text = text
-        self.txt_preview.setPlainText(text)
-        self.lbl_status.setText(f"Loaded: {Path(path).name}  ({len(text)} chars)")
 
     def _start(self):
         resume = self.txt_preview.toPlainText().strip()
@@ -213,7 +215,12 @@ class SetupView(QWidget):
             QMessageBox.warning(self, "Need a resume", "Load a resume before starting.")
             return
         personal = self.in_personal.toPlainText().strip()
-        # Persist personal context so the user doesn't retype it each session.
+        # Persist so the setup screen restores this session's resume/role/
+        # personal context next launch instead of starting blank.
+        self.cfg.resume_text = resume
+        self.cfg.resume_filename = self._resume_filename
+        self.cfg.job_title = self.in_title.text().strip()
+        self.cfg.job_description = self.in_jd.toPlainText().strip()
         self.cfg.personal_context = personal
         self.cfg.save()
         self.ready.emit(
@@ -262,6 +269,10 @@ class SetupView(QWidget):
             if self.cfg.mic_device_index is not None
             else "default mic"
         )
+        if self.mode == MODE_HELPER:
+            # One mic hears both speakers; no loopback in this mode.
+            self.lbl_audio.setText(f"Helper-laptop audio: {mic} (single mic, voice-distinguished)")
+            return
         loopback = (
             f"loopback #{self.cfg.loopback_device_index}"
             if self.cfg.loopback_device_index is not None
@@ -275,12 +286,12 @@ class SetupView(QWidget):
             self._refresh_stt_label()
 
     def _audio_settings(self) -> None:
-        dlg = AudioDeviceDialog(self.cfg)
+        dlg = AudioDeviceDialog(self.cfg, single_device=(self.mode == MODE_HELPER))
         if dlg.exec() == dlg.DialogCode.Accepted:
             self._refresh_audio_label()
 
     def _reenroll_voice(self) -> None:
-        dlg = VoiceEnrollDialog()
+        dlg = VoiceEnrollDialog(device_index=self.cfg.mic_device_index)
         if dlg.exec() != dlg.DialogCode.Accepted or dlg.embedding is None:
             return
         self.cfg.candidate_voice_embedding = [float(x) for x in dlg.embedding]

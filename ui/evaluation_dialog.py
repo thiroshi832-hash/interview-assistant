@@ -11,9 +11,9 @@ from __future__ import annotations
 import threading
 from html import escape
 
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import Signal, Slot
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QScrollArea,
+    QDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 

@@ -36,7 +36,7 @@ class VoiceEnrollDialog(QDialog):
     _tick = Signal(float)
     _done = Signal(object)  # np.ndarray | None
 
-    def __init__(self):
+    def __init__(self, device_index: Optional[int] = None):
         super().__init__()
         self.setWindowTitle("Voice setup")
         self.setStyleSheet(STYLE)
@@ -44,6 +44,9 @@ class VoiceEnrollDialog(QDialog):
 
         self.embedding: Optional[np.ndarray] = None
         self._recorder = None
+        # Record enrollment from the SAME mic the interview uses (None =
+        # system default) so the fingerprint matches what's captured live.
+        self._device_index = device_index
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -127,6 +130,7 @@ class VoiceEnrollDialog(QDialog):
             duration_sec=DURATION_SEC,
             on_tick=lambda remaining: self._tick.emit(remaining),
             on_done=lambda emb: self._done.emit(emb),
+            device_index=self._device_index,
         )
         self._recorder.start()
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 
 from audio.auto_labeler import AutoLabeler
+from pipeline.context_summary import ContextSummarizer
 from pipeline.echo_filter import is_echo
 from pipeline.interview_health import compute_health
 from pipeline.license import (
@@ -33,6 +34,37 @@ def test_transcript_ignores_empty() -> None:
     t = Transcript()
     assert t.add("interviewer", "   ") is None
     assert t.snapshot() == []
+
+
+def test_transcript_stale_partial_does_not_reorder() -> None:
+    # A candidate partial that never finalizes (e.g. an interviewer-bleed
+    # blip) must not be resurrected out of order when the candidate later
+    # really speaks. The real speech should append at the END, after the
+    # interviewer turn that arrived in between — not overwrite the stale
+    # partial at its old (earlier) position.
+    t = Transcript()
+    t.update_partial("candidate", "Continuing", ts=1.0)          # stray, never finalizes
+    t.commit("interviewer", "Continuing from the safeguards, can you...", ts=2.0)
+    t.update_partial("candidate", "So for a follow-up strategy", ts=3.0)   # real speech
+
+    texts = [(s.speaker, s.text) for s in t.snapshot()]
+    # Real candidate speech is last, in chronological order.
+    assert texts[-1] == ("candidate", "So for a follow-up strategy"), texts
+    # The interviewer turn precedes the candidate's real speech.
+    intv_idx = texts.index(("interviewer", "Continuing from the safeguards, can you..."))
+    cand_idx = len(texts) - 1
+    assert intv_idx < cand_idx, texts
+
+
+def test_transcript_active_partial_still_replaces_in_place() -> None:
+    # Normal case: consecutive partials from the same active speaker replace
+    # in place (no duplicate lines) as long as nothing else interleaves.
+    t = Transcript()
+    t.update_partial("candidate", "So for", ts=1.0)
+    t.update_partial("candidate", "So for a follow-up", ts=1.5)
+    t.commit("candidate", "So for a follow-up strategy.", ts=2.0)
+    texts = [(s.speaker, s.text) for s in t.snapshot()]
+    assert texts == [("candidate", "So for a follow-up strategy.")], texts
 
 
 def test_question_detector_question_mark() -> None:
@@ -199,6 +231,25 @@ def test_echo_filter_respects_lag_window() -> None:
     assert is_echo(same_text, [old], candidate_ts=110.0) is False
 
 
+def test_echo_filter_catches_echo_during_in_progress_interviewer_turn() -> None:
+    # Long interviewer turn still in progress (not yet committed): its text
+    # lives in snapshot() as a partial but NOT in snapshot_finalized(). The
+    # mic's acoustic echo of the tail finalizes before the interviewer turn
+    # commits. The filter must catch it — which only works when it compares
+    # against the full snapshot (the app.py fix), not finalized turns only.
+    t = Transcript()
+    t.update_partial(
+        "interviewer",
+        "tell me about a time you had to scale a distributed system under heavy load",
+        ts=100.0,
+    )
+    echo_text = "scale a distributed system under heavy load"
+    # Finalized-only (the old behavior) can't see the in-progress turn:
+    assert is_echo(echo_text, t.snapshot_finalized(), candidate_ts=100.3) is False
+    # Full snapshot (the fix) correctly flags the echo:
+    assert is_echo(echo_text, t.snapshot(), candidate_ts=100.3) is True
+
+
 def test_health_no_turns() -> None:
     h = compute_health([])
     assert h.score == 70 and h.label == "waiting"
@@ -257,6 +308,85 @@ def test_trial_countdown() -> None:
     assert days_remaining(now - 100 * 86400, now=now) == 0
     assert not trial_expired(now - 5 * 86400, now=now)
     assert trial_expired(now - (TRIAL_DAYS + 1) * 86400, now=now)
+
+
+def _turns(n: int, start_ts: float = 1.0) -> list[Turn]:
+    out = []
+    for i in range(n):
+        speaker = "interviewer" if i % 2 == 0 else "candidate"
+        out.append(Turn(speaker=speaker, text=f"turn {i}", ts=start_ts + i))
+    return out
+
+
+def test_context_summary_under_budget_folds_nothing() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(5)
+    # Whole transcript fits the budget → nothing folded, everything verbatim.
+    assert cs.turns_to_fold(turns, budget_tokens=10_000, min_verbatim=12) == []
+    assert cs.should_update(turns, 10_000, 12) is False
+    assert [t.text for t in cs.unfolded(turns)] == [t.text for t in turns]
+
+
+def test_context_summary_folds_oldest_over_budget() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(20)
+    # budget=0 forces folding down to the min-verbatim floor: 20 - 12 = 8 oldest.
+    to_fold = cs.turns_to_fold(turns, budget_tokens=0, min_verbatim=12)
+    assert [t.text for t in to_fold] == [f"turn {i}" for i in range(8)]
+    assert cs.should_update(turns, 0, 12) is True
+
+
+def test_context_summary_never_folds_below_min_verbatim() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(14)
+    # Even wildly over budget, keep >= min_verbatim recent turns verbatim.
+    to_fold = cs.turns_to_fold(turns, budget_tokens=0, min_verbatim=12)
+    assert len(to_fold) == 2                       # 14 - 12
+    # With only min_verbatim turns, nothing is foldable.
+    assert cs.turns_to_fold(_turns(12), budget_tokens=0, min_verbatim=12) == []
+
+
+def test_context_summary_respects_token_budget() -> None:
+    cs = ContextSummarizer()
+    # 10 turns of 40 chars each = 400 chars => 100 est-tokens total.
+    turns = [Turn(speaker="candidate", text="x" * 40, ts=1.0 + i) for i in range(10)]
+    # budget 50 tokens (=200 chars => 5 turns), min_verbatim small so budget binds.
+    to_fold = cs.turns_to_fold(turns, budget_tokens=50, min_verbatim=2)
+    assert len(to_fold) == 5                       # keep 5 (=50 tokens) verbatim
+
+
+def test_context_summary_apply_update_advances_cursor() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(20)
+    to_fold = cs.turns_to_fold(turns, budget_tokens=0, min_verbatim=12)
+    cs.apply_update(to_fold, "The candidate discussed X and Y.")
+    assert cs.summary == "The candidate discussed X and Y."
+    # Folded turns drop out of the verbatim set exactly as they enter the summary.
+    assert [t.text for t in cs.unfolded(turns)] == [f"turn {i}" for i in range(8, 20)]
+    # Only the min-verbatim floor remains → nothing more to fold.
+    assert cs.turns_to_fold(turns, budget_tokens=0, min_verbatim=12) == []
+
+
+def test_context_summary_folded_turns_dont_repeat_on_growth() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(20)
+    cs.apply_update(cs.turns_to_fold(turns, 0, 12), "summary so far")
+    # More turns arrive; already-folded turns must not reappear as verbatim.
+    grown = _turns(30)
+    assert [t.text for t in cs.unfolded(grown)] == [f"turn {i}" for i in range(8, 30)]
+    # And the next fold takes the oldest of the NEW unfolded set, never re-folds.
+    again = cs.turns_to_fold(grown, 0, 12)
+    assert again[0].text == "turn 8"
+
+
+def test_context_summary_reset_clears_state() -> None:
+    cs = ContextSummarizer()
+    turns = _turns(20)
+    cs.apply_update(cs.turns_to_fold(turns, 0, 12), "summary")
+    cs.reset()
+    assert cs.summary == ""
+    # Cursor reset → the whole transcript is verbatim again.
+    assert [t.text for t in cs.unfolded(turns)] == [t.text for t in turns]
 
 
 def main() -> int:

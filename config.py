@@ -28,7 +28,11 @@ class Config:
 
     # ── Provider ──────────────────────────────────────────────────────────────
     provider: str = "anthropic"              # "anthropic" or "openai"
-    max_tokens: int = 2048
+    # Backstop cap on a single live answer. The SYSTEM_RULES prompt is what
+    # actually shapes answer length (kept short/plain); this just prevents a
+    # runaway. 768 leaves ample headroom for a "Deeper"/"More technical" answer
+    # without letting the default answer sprawl.
+    max_tokens: int = 768
 
     # ── Anthropic ─────────────────────────────────────────────────────────────
     anthropic_api_key: str = ""
@@ -42,11 +46,17 @@ class Config:
     openai_deep_model: str = "gpt-4o"        # used by the "deeper answer" hotkey
 
     # ── STT ───────────────────────────────────────────────────────────────────
-    # "whispercpp" = pywhispercpp streaming (partials during speech, CPU-friendly)
-    # "deepgram"   = cloud streaming (lowest latency, requires API key + internet)
-    # (legacy "batch" / faster-whisper was removed in the slim-down — any saved
-    #  config with "batch" is auto-migrated to "whispercpp" at startup.)
-    stt_engine: str = "whispercpp"
+    # "deepgram"   = cloud streaming (lowest latency + server-side diarization,
+    #                which is what makes helper-laptop-acoustic speaker
+    #                attribution work well; requires an API key + internet).
+    # "whispercpp" = pywhispercpp on-device streaming (CPU-friendly, no key, but
+    #                NO speaker tags — helper mode then leans on the weaker local
+    #                voice clustering).
+    # Default is "deepgram"; with no API key it transparently falls back to
+    # whisper.cpp at runtime (see pipeline.stt_engines.effective_stt_engine),
+    # so a keyless install still works. Legacy "batch"/faster-whisper was removed
+    # in the slim-down — any saved "batch" config is migrated to whispercpp.
+    stt_engine: str = "deepgram"
     deepgram_api_key: str = ""
     deepgram_model: str = "nova-3"           # nova-3 is current best for english
     # base.en is ~3x faster than small.en on CPU with only a small accuracy
@@ -79,6 +89,17 @@ class Config:
     # across a desk) and quiet speech gets missed.
     vad_threshold: float = 0.35
 
+    # ── Mic noise gate (same-laptop / helper-network) ─────────────────────────
+    # The mic should carry only the candidate, who speaks directly into it.
+    # The interviewer's audio leaks in acoustically at much lower volume; a
+    # finalized "candidate" utterance whose PEAK level (loudest ~100 ms window)
+    # is below this floor is treated as that bleed and dropped. Peak — not mean
+    # — because Deepgram's buffer can accumulate long silences that dilute a
+    # mean, wrongly dropping real speech. Faint bleed peaks stay low (a few
+    # hundred); real speech peaks reach the thousands. Lower it if your own
+    # speech gets dropped; raise it if faint interviewer bleed still slips in.
+    mic_gate_rms: int = 600
+
     # ── Diarization (single-mic mode) ─────────────────────────────────────────
     auto_label_min_utterances: int = 3       # turns to observe per cluster before locking labels
 
@@ -91,7 +112,15 @@ class Config:
     question_silence_ms: int = 1200          # interviewer-finished-talking heuristic (silence-net trigger)
 
     # ── Conversation context ──────────────────────────────────────────────────
-    rolling_turns: int = 8                   # how many prior turns to send to Claude
+    # The WHOLE conversation is sent verbatim on every answer — a full interview
+    # fits comfortably in the model's context, and the resume/role prefix is
+    # prompt-cached. Compression is only a safety valve for marathon sessions:
+    # once the verbatim transcript exceeds `context_token_budget` tokens, the
+    # OLDEST turns are folded into a running summary (pipeline/context_summary.py),
+    # always leaving at least `min_verbatim_turns` recent turns verbatim.
+    # (Token count is a cheap len//4 estimate — no tokenizer dependency.)
+    context_token_budget: int = 6000
+    min_verbatim_turns: int = 12
 
     # ── UI ────────────────────────────────────────────────────────────────────
     answer_font_size: int = 16               # pixels; the A− / A+ buttons persist here
@@ -99,8 +128,22 @@ class Config:
     # Last resume file loaded via Setup. Auto-loaded on next launch if the file
     # still exists — saves the user from repicking the same PDF every session.
     resume_path: str = ""
+    # Persisted main-window size. Restored (clamped to the screen) on launch and
+    # saved on close, so the height you set sticks between sessions. Kept as a
+    # fallback for first launch / when window_geometry is missing or invalid.
+    window_width: int = 1280
+    window_height: int = 760
+    # Full Qt geometry blob (QWidget.saveGeometry, base64). Unlike width/height
+    # it also preserves the window POSITION, the maximized state, and the
+    # pre-maximize "normal" geometry — so closing while maximized restores a
+    # maximized window whose un-maximize returns to the original size/place.
+    window_geometry: str = ""
 
     # ── Interview metadata (filled in by the UI before "Start") ───────────────
+    # Persisted so the setup screen restores the last session's resume/role
+    # instead of starting blank every launch.
+    resume_text: str = ""
+    resume_filename: str = ""        # display-only, for the "Restored: ..." label
     job_title: str = ""
     job_description: str = ""
     # Personal context the resume doesn't cover — salary expectations, start date,

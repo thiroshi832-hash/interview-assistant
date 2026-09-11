@@ -13,6 +13,7 @@ from typing import Iterator, Sequence
 import anthropic
 
 from config import Config
+from pipeline.context_summary import build_update_prompt
 from pipeline.evaluation import (
     EVALUATION_SCHEMA, EVALUATION_USER_PROMPT, InterviewEvaluation,
     format_transcript,
@@ -20,29 +21,32 @@ from pipeline.evaluation import (
 from pipeline.types import Turn
 
 
-SYSTEM_RULES = """You are answering interview questions on behalf of the candidate, in their voice, in real time during a live interview. The answer is going to be READ ALOUD by the candidate. It must sound like a real engineer thinking out loud, NOT like a blog post or a memorized pitch.
+SYSTEM_RULES = """You are answering interview questions on behalf of the candidate, in their voice, in real time during a live interview. The answer is going to be READ ALOUD by the candidate. It must be plain, direct, professional spoken English — not a blog post, not a memorized pitch, and not folksy improvisation.
 
-SOUND HUMAN. Use the rhythms of natural speech:
-- Mix sentence lengths. Some short. Some longer with a couple of clauses.
-- Use contractions everywhere: "we'd", "I've", "it's", "didn't" — never "we would" / "I have" / "did not".
-- Light hedging is fine when honest: "I think", "kind of", "basically", "around 5,000", "if I remember right".
-- Soft mid-sentence corrections feel real, sparingly: "we used Redis — well, Redis and then later Postgres."
-- Talk in the FIRST SENTENCE before backing into context. Lead with the answer, then the example.
-- Use "so", "yeah", "right" as natural connectives at most once per answer — not as openers.
+STYLE — plain, direct, professional spoken English:
+- Answer the question in the FIRST sentence, then back it with the example or detail.
+- Use contractions ("we'd", "I've", "it's") — it's spoken language, not an essay.
+- Mix sentence lengths, but keep every sentence plain and to the point.
+- NO conversational filler — never open with or insert "You know", "Yeah", "So,", "Well,", "Honestly", "Hmm", "Right,", "Look," or similar.
+- NO jokes, wordplay, or folksy/colorful imagery (e.g. "it made my hands dirty") — keep it factual and professional.
+- NO performative hedging or fake self-corrections ("kind of", "basically", "— well, actually"). State things cleanly; if genuinely unsure, say so once, plainly.
+- This answer is SPOKEN ALOUD, not written. Do NOT output code, code blocks, pseudocode, or anything that can't be read aloud naturally. Describe the approach in words — name the function/API/pattern and say what it does — instead of writing it out. Only if the interviewer explicitly asks you to write code, keep it to the few essential lines and say them plainly.
 
 AVOID THESE TELLS that make answers sound AI-generated:
 - "Great question", "Happy to discuss", "I'd love to share"
 - "I hope that helps", "Does that answer your question?"
 - Corporate filler: "leverage", "synergize", "robust", "best-in-class", "scalable solutions", "deep dive"
-- Formulaic structure: "Firstly... Secondly... Thirdly..." (say "First off..." / "And then..." / "The other piece...")
+- Formulaic structure: "Firstly... Secondly... Thirdly..." — just state the points in plain sentences
 - Bullet-point list structure inside a spoken answer
 - Excessive hedging: "I would perhaps suggest that..." — just say it
 - Perfectly polished STAR with explicit S/T/A/R labels — compress it into how someone would actually narrate the story
 
-LENGTH — keep it short, running long sounds unprepared:
+LENGTH — SHORT is the default. Long answers sound rehearsed and eat the interviewer's time:
 - Clarifying questions: 1 sentence.
-- Behavioral questions: 2-3 sentences. One compressed STAR beat (situation → action → result, skip "task").
-- Technical / system-design questions: 3-5 sentences. Lead with the most important point. The interviewer will follow up if they want detail.
+- Behavioral questions: 2 sentences — one compressed STAR beat (situation → action → result).
+- Technical / system-design questions: 2-3 sentences. Lead with the single most important point, then stop — the interviewer will follow up if they want more.
+- One idea per answer. Don't stack three points where one lands. If the answer is complete in a sentence, give one sentence — never pad to fill space.
+- Plain, everyday words over fancy ones; short sentences over long ones.
 - Expand only when explicitly asked (style override like "more technical, include specifics").
 
 ACCURACY:
@@ -155,6 +159,27 @@ class ClaudeClient:
                 error=f"Evaluation failed: {e}",
             )
 
+    # ── running context summary (see pipeline/context_summary.py) ─────────────
+    def summarize(self, prior_summary: str, new_turns: Sequence[Turn]) -> str:
+        """
+        Fold `new_turns` (aged out of the rolling transcript window) into a
+        compact running summary, so later answers stay consistent with the
+        whole interview without resending it verbatim every time. Cheap
+        model, low effort, small max_tokens — called off the live-answer
+        path, never blocks a `stream_answer()` call.
+        """
+        response = self._client.messages.create(
+            model=self.cfg.model,
+            max_tokens=300,
+            messages=[{"role": "user", "content": build_update_prompt(prior_summary, new_turns)}],
+            output_config={"effort": "low"},
+        )
+        text = next(
+            (b.text for b in response.content if getattr(b, "type", None) == "text"),
+            "",
+        )
+        return text.strip()
+
     # ── per-question ─────────────────────────────────────────────────────────
     def stream_answer(
         self,
@@ -162,6 +187,7 @@ class ClaudeClient:
         *,
         deep: bool = False,
         style_hint: str = "",
+        summary: str = "",
     ) -> Iterator[str]:
         """
         Yield text chunks of the answer as Claude streams it.
@@ -171,12 +197,14 @@ class ClaudeClient:
 
         `deep=True` swaps to the deep-mode model (Opus 4.7 by default).
         `style_hint` is appended to nudge length/tone, e.g. "shorter" or "more technical".
+        `summary` is the running summary of everything older than `turns` — see
+        pipeline/context_summary.py. Empty string if there's nothing to summarize yet.
         """
         if not self._resume_text:
             raise RuntimeError("Call set_context() with the resume before requesting an answer.")
 
         system = self._build_system_blocks()
-        user_message = self._build_user_message(turns, style_hint=style_hint)
+        user_message = self._build_user_message(turns, style_hint=style_hint, summary=summary)
         model = self.cfg.deep_model if deep else self.cfg.model
 
         with self._client.messages.stream(
@@ -220,20 +248,25 @@ class ClaudeClient:
             },
         ]
 
-    def _build_user_message(self, turns: Sequence[Turn], *, style_hint: str = "") -> str:
+    def _build_user_message(self, turns: Sequence[Turn], *, style_hint: str = "", summary: str = "") -> str:
         if not turns:
             return "Provide a brief self-introduction in the candidate's voice based on the resume."
 
-        # Rolling transcript, oldest first
+        # Full conversation, oldest first (the controller already trims only
+        # what's been folded into `summary`; everything else is sent verbatim).
         lines = []
-        for t in turns[-self.cfg.rolling_turns:]:
+        for t in turns:
             label = "INTERVIEWER" if t.speaker == "interviewer" else "CANDIDATE"
             lines.append(f"[{label}] {t.text.strip()}")
 
         transcript = "\n".join(lines)
         hint = f"\n\nStyle override for this answer: {style_hint}." if style_hint else ""
+        summary_block = (
+            f"Summary of the interview before the excerpt below:\n{summary}\n\n" if summary else ""
+        )
 
         return (
+            f"{summary_block}"
             f"Conversation so far:\n\n{transcript}\n\n"
             "Answer the LAST interviewer turn above. If the candidate has already started "
             "speaking in response, continue from where they left off; otherwise produce "

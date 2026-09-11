@@ -1,6 +1,8 @@
 """Main window: holds the setup view, then swaps to the interview view."""
 from __future__ import annotations
 
+from PySide6.QtCore import QByteArray
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QMainWindow, QStackedWidget
 
 from config import Config
@@ -10,15 +12,22 @@ from ui.style import STYLE
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, mode: str = ""):
         super().__init__()
         self.cfg = cfg
+        self.mode = mode
         self.setWindowTitle("AetherStack Interview Assistant")
         self.setStyleSheet(STYLE)
-        self.resize(1280, 760)
+        # Let the window shrink well below the content's natural size so it can
+        # be made short AND narrow (e.g. a slim strip beside the interview
+        # window). The explicit minimum overrides the layout's own minimum
+        # (~1113x925 from the button row / panels); content clips or scrolls
+        # rather than pinning a size the user can't drag past.
+        self.setMinimumSize(320, 200)
+        self._restore_geometry()
 
         self.stack = QStackedWidget()
-        self.setup_view = SetupView(cfg)
+        self.setup_view = SetupView(cfg, mode)
         self.interview_view = InterviewView()
         # Restore persisted UI preferences
         self.interview_view.set_font_size(cfg.answer_font_size)
@@ -54,3 +63,48 @@ class MainWindow(QMainWindow):
 
     def show_setup(self):
         self.stack.setCurrentWidget(self.setup_view)
+
+    # ── window geometry persistence ──────────────────────────────────────────
+    def _restore_geometry(self) -> None:
+        """Restore the full saved geometry (position + size + maximized state +
+        pre-maximize normal geometry). Falls back to a screen-clamped, centered
+        default on first launch or if the saved blob is invalid/stale."""
+        blob = self.cfg.window_geometry
+        if blob:
+            try:
+                if self.restoreGeometry(QByteArray.fromBase64(blob.encode("ascii"))):
+                    return
+            except Exception:
+                pass
+        w = int(self.cfg.window_width or 1280)
+        h = int(self.cfg.window_height or 760)
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            w = min(w, avail.width())
+            h = min(h, avail.height())
+        self.resize(max(w, 320), max(h, 200))
+        if screen is not None:
+            fg = self.frameGeometry()
+            fg.moveCenter(avail.center())
+            self.move(fg.topLeft())
+
+    def closeEvent(self, event) -> None:
+        # Persist the full geometry for next launch. saveGeometry() encodes the
+        # NORMAL geometry separately from the maximized flag, so closing while
+        # maximized doesn't overwrite the original size/position.
+        try:
+            self.cfg.window_geometry = bytes(
+                self.saveGeometry().toBase64()
+            ).decode("ascii")
+        except Exception:
+            self.cfg.window_geometry = ""
+        # Keep the legacy fallback fields on the UN-maximized size.
+        g = self.normalGeometry() if self.isMaximized() else self.geometry()
+        self.cfg.window_width = g.width()
+        self.cfg.window_height = g.height()
+        try:
+            self.cfg.save()
+        except Exception:
+            pass
+        super().closeEvent(event)
